@@ -293,6 +293,54 @@ CHOOSE_LANGUAGE_TEXT = (
     "Choose your language 👇"
 )
 
+# =====================================================================
+# ХРАНЕНИЕ ПОСЛЕДНЕГО СООБЩЕНИЯ БОТА ДЛЯ КАЖДОГО ЧАТА
+# =====================================================================
+
+# chat_id -> message_id последнего «экрана» бота
+_LAST_BOT_MESSAGES: Dict[int, int] = {}
+
+
+async def _delete_last_screen(bot: Bot, chat_id: int) -> None:
+    msg_id = _LAST_BOT_MESSAGES.get(chat_id)
+    if not msg_id:
+        return
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        # уже удалено / слишком старое — просто игнорируем
+        pass
+
+
+async def _send_screen(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+    img_path: Optional[Path] = None,
+) -> None:
+    """
+    Универсальный отправщик «окон»:
+    перед отправкой нового экрана удаляем предыдущий.
+    """
+    await _delete_last_screen(bot, chat_id)
+
+    if img_path:
+        msg = await bot.send_photo(
+            chat_id,
+            photo=FSInputFile(str(img_path)),
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    else:
+        msg = await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+        )
+
+    _LAST_BOT_MESSAGES[chat_id] = msg.message_id
+
 
 # =====================================================================
 # ВСПОМОГАТЕЛЬНОЕ
@@ -327,17 +375,6 @@ def _get_miniapp_url_for_user(user: Optional[User]) -> Optional[str]:
         return BASIC_MINIAPP_URL
 
     return None
-
-
-def _add_click_id(url: Optional[str], tg_id: int | str) -> str:
-    """
-    Добавляет к ссылке параметр click_id=<tg_id>, чтобы постбэк знал Telegram ID.
-    Если url пустой — возвращаем пустую строку.
-    """
-    if not url:
-        return ""
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}click_id={tg_id}"
 
 
 async def _get_or_create_user(tg_id: int, username: Optional[str] = None) -> User:
@@ -481,32 +518,26 @@ def _subscribe_markup(lang: str, channel_url: Optional[str]):
     return kb.as_markup()
 
 
-def _registration_markup(lang: str, ref_link: Optional[str], tg_id: Optional[int] = None):
+def _registration_markup(lang: str, ref_link: Optional[str]):
     labels = get_labels(lang)
     kb = InlineKeyboardBuilder()
     if ref_link:
-        url = _add_click_id(ref_link, tg_id) if tg_id is not None else ref_link
         kb.button(
             text="📝 Зарегистрироваться" if lang == "ru" else "📝 Register",
-            url=url,
+            url=ref_link,
         )
     kb.button(text=labels["back_to_menu"], callback_data="menu:back_to_menu")
     kb.adjust(1, 1)
     return kb.as_markup()
 
 
-def _deposit_markup(
-    lang: str,
-    deposit_link: Optional[str],
-    tg_id: Optional[int] = None,
-):
+def _deposit_markup(lang: str, deposit_link: Optional[str]):
     labels = get_labels(lang)
     kb = InlineKeyboardBuilder()
     if deposit_link:
-        url = _add_click_id(deposit_link, tg_id) if tg_id is not None else deposit_link
         kb.button(
             text="💰 Сделать депозит" if lang == "ru" else "💰 Make deposit",
-            url=url,
+            url=deposit_link,
         )
     kb.button(text=labels["back_to_menu"], callback_data="menu:back_to_menu")
     kb.adjust(1, 1)
@@ -540,18 +571,13 @@ def _access_opened_markup(lang: str, user: User):
     return kb.as_markup()
 
 
-def _limited_markup(
-    lang: str,
-    deposit_link: Optional[str],
-    tg_id: Optional[int] = None,
-):
+def _limited_markup(lang: str, deposit_link: Optional[str]):
     labels = get_labels(lang)
     kb = InlineKeyboardBuilder()
     if deposit_link:
-        url = _add_click_id(deposit_link, tg_id) if tg_id is not None else deposit_link
         kb.button(
             text="💰 Сделать депозит" if lang == "ru" else "💰 Make deposit",
-            url=url,
+            url=deposit_link,
         )
     kb.button(text=labels["back_to_menu"], callback_data="menu:back_to_menu")
     kb.adjust(1, 1)
@@ -591,18 +617,10 @@ async def notify_basic_access_limited(bot: Bot, tg_id: int) -> None:
     required = float(settings.deposit_required_amount or 0)
     text_tpl = LIMITED_BASIC_TEXT.get(lang, LIMITED_BASIC_TEXT["en"])
     text = text_tpl.format(required=required)
-    markup = _limited_markup(lang, settings.deposit_link, tg_id=tg_id)
+    markup = _limited_markup(lang, settings.deposit_link)
 
     img_path = _get_image_path(lang, "deposit")
-    if img_path:
-        await bot.send_photo(
-            tg_id,
-            photo=FSInputFile(str(img_path)),
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await bot.send_message(tg_id, text, reply_markup=markup)
+    await _send_screen(bot, tg_id, text, reply_markup=markup, img_path=img_path)
 
 
 async def notify_vip_access_limited(bot: Bot, tg_id: int) -> None:
@@ -611,18 +629,10 @@ async def notify_vip_access_limited(bot: Bot, tg_id: int) -> None:
     vip_thr = float(settings.vip_threshold_amount or 0)
     text_tpl = LIMITED_VIP_TEXT.get(lang, LIMITED_VIP_TEXT["en"])
     text = text_tpl.format(vip=vip_thr)
-    markup = _limited_markup(lang, settings.deposit_link, tg_id=tg_id)
+    markup = _limited_markup(lang, settings.deposit_link)
 
     img_path = _get_image_path(lang, "deposit")
-    if img_path:
-        await bot.send_photo(
-            tg_id,
-            photo=FSInputFile(str(img_path)),
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await bot.send_message(tg_id, text, reply_markup=markup)
+    await _send_screen(bot, tg_id, text, reply_markup=markup, img_path=img_path)
 
 
 async def notify_vip_granted(bot: Bot, tg_id: int) -> None:
@@ -635,15 +645,7 @@ async def notify_vip_granted(bot: Bot, tg_id: int) -> None:
     markup = _access_opened_markup(lang, user)
 
     img_path = _get_image_path(lang, "vip_opened")
-    if img_path:
-        await bot.send_photo(
-            tg_id,
-            photo=FSInputFile(str(img_path)),
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await bot.send_message(tg_id, text, reply_markup=markup)
+    await _send_screen(bot, tg_id, text, reply_markup=markup, img_path=img_path)
 
 
 # =====================================================================
@@ -672,14 +674,7 @@ async def send_main_menu(
     markup = _build_main_menu_markup(lang, support_url, user)
     img_path = _get_image_path(lang, "main_menu")
 
-    if img_path:
-        await message.answer_photo(
-            photo=FSInputFile(str(img_path)),
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await message.answer(text, reply_markup=markup)
+    await _send_screen(message.bot, message.chat.id, text, reply_markup=markup, img_path=img_path)
 
 
 async def send_language_choice(message: Message, lang: str | None = None) -> None:
@@ -690,17 +685,14 @@ async def send_language_choice(message: Message, lang: str | None = None) -> Non
 
     img_lang = lang if (lang is not None and lang in LANG_TITLES) else "en"
     img_path = _get_image_path(img_lang, "language_choice")
-    if img_path:
-        await message.answer_photo(
-            photo=FSInputFile(str(img_path)),
-            caption=CHOOSE_LANGUAGE_TEXT,
-            reply_markup=kb.as_markup(),
-        )
-    else:
-        await message.answer(
-            CHOOSE_LANGUAGE_TEXT,
-            reply_markup=kb.as_markup(),
-        )
+
+    await _send_screen(
+        message.bot,
+        message.chat.id,
+        CHOOSE_LANGUAGE_TEXT,
+        reply_markup=kb.as_markup(),
+        img_path=img_path,
+    )
 
 
 # =====================================================================
@@ -712,14 +704,15 @@ async def _open_miniapp(bot: Bot, chat_id: int, user: User, settings: Settings) 
 
     url = _get_miniapp_url_for_user(user)
     if not url:
-        await bot.send_message(
+        await _send_screen(
+            bot,
             chat_id,
             "⚠️ URL мини-аппы не настроен. Задай BASIC_MINIAPP_URL / VIP_MINIAPP_URL в .env.",
         )
         return
 
     markup = _miniapp_markup(lang, url)
-    await bot.send_message(chat_id, "🚀 Мини-аппа:", reply_markup=markup)
+    await _send_screen(bot, chat_id, "🚀 Мини-аппа:", reply_markup=markup)
 
 
 # =====================================================================
@@ -753,36 +746,20 @@ async def _run_flow(bot: Bot, chat_id: int, tg_id: int) -> None:
             text = SUBSCRIPTION_TEXT.get(lang, SUBSCRIPTION_TEXT["en"])
             markup = _subscribe_markup(lang, settings.channel_url)
             img_path = _get_image_path(lang, "subscription")
-            if img_path:
-                await bot.send_photo(
-                    chat_id,
-                    photo=FSInputFile(str(img_path)),
-                    caption=text,
-                    reply_markup=markup,
-                )
-            else:
-                await bot.send_message(chat_id, text, reply_markup=markup)
+            await _send_screen(bot, chat_id, text, reply_markup=markup, img_path=img_path)
             return
 
     # 2. регистрация (обязательный шаг)
     if not user.is_registered and not user.trader_id:
         if not settings.ref_link:
             text = CONFIG_ERROR_TEXT.get(lang, CONFIG_ERROR_TEXT["en"])
-            await bot.send_message(chat_id, text)
+            await _send_screen(bot, chat_id, text)
             return
 
         text = REGISTRATION_TEXT.get(lang, REGISTRATION_TEXT["en"])
-        markup = _registration_markup(lang, settings.ref_link, tg_id=tg_id)
+        markup = _registration_markup(lang, settings.ref_link)
         img_path = _get_image_path(lang, "registration")
-        if img_path:
-            await bot.send_photo(
-                chat_id,
-                photo=FSInputFile(str(img_path)),
-                caption=text,
-                reply_markup=markup,
-            )
-        else:
-            await bot.send_message(chat_id, text, reply_markup=markup)
+        await _send_screen(bot, chat_id, text, reply_markup=markup, img_path=img_path)
         return
 
     # 3. депозит (если включён)
@@ -794,28 +771,20 @@ async def _run_flow(bot: Bot, chat_id: int, tg_id: int) -> None:
     if need_deposit:
         if required_dep <= 0:
             text = CONFIG_ERROR_TEXT.get(lang, CONFIG_ERROR_TEXT["en"])
-            await bot.send_message(chat_id, text)
+            await _send_screen(bot, chat_id, text)
             return
 
         if total_deposit < required_dep:
             if not settings.deposit_link:
                 text = CONFIG_ERROR_TEXT.get(lang, CONFIG_ERROR_TEXT["en"])
-                await bot.send_message(chat_id, text)
+                await _send_screen(bot, chat_id, text)
                 return
 
             text_tpl = DEPOSIT_TEXT.get(lang, DEPOSIT_TEXT["en"])
             text = text_tpl.format(required=required_dep, current=total_deposit)
-            markup = _deposit_markup(lang, settings.deposit_link, tg_id=tg_id)
+            markup = _deposit_markup(lang, settings.deposit_link)
             img_path = _get_image_path(lang, "deposit")
-            if img_path:
-                await bot.send_photo(
-                    chat_id,
-                    photo=FSInputFile(str(img_path)),
-                    caption=text,
-                    reply_markup=markup,
-                )
-            else:
-                await bot.send_message(chat_id, text, reply_markup=markup)
+            await _send_screen(bot, chat_id, text, reply_markup=markup, img_path=img_path)
             return
 
     # 4. все шаги пройдены → открываем доступ (+ проверяем VIP по сумме депозитов)
@@ -841,15 +810,7 @@ async def _run_flow(bot: Bot, chat_id: int, tg_id: int) -> None:
 
     markup = _access_opened_markup(lang, user)
     img_path = _get_image_path(lang, "access_opened")
-    if img_path:
-        await bot.send_photo(
-            chat_id,
-            photo=FSInputFile(str(img_path)),
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await bot.send_message(chat_id, text, reply_markup=markup)
+    await _send_screen(bot, chat_id, text, reply_markup=markup, img_path=img_path)
 
 
 # =====================================================================
@@ -875,19 +836,7 @@ async def handle_instruction(callback: CallbackQuery) -> None:
     markup = _back_markup(lang)
     img_path = _get_image_path(lang, "instruction")
 
-    if img_path:
-        await callback.message.bot.send_photo(
-            chat_id,
-            photo=FSInputFile(str(img_path)),
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await callback.message.bot.send_message(
-            chat_id,
-            text,
-            reply_markup=markup,
-        )
+    await _send_screen(callback.message.bot, chat_id, text, reply_markup=markup, img_path=img_path)
 
 
 @router.callback_query(F.data == "menu:get_signal")

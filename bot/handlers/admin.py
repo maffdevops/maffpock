@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, List
 
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from sqlalchemy import select, func
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from sqlalchemy import select, func, delete
 
 from ..models import base as db
 from ..models.user import User
@@ -26,7 +30,6 @@ router = Router()
 
 
 # ===== ADMIN ACCESS =====
-
 
 def _load_admin_ids() -> set[int]:
     raw = os.getenv("ADMIN_IDS", "")
@@ -50,7 +53,6 @@ def _is_admin(user_id: int) -> bool:
 
 # ===== STATES =====
 
-
 class AdminLinksState(StatesGroup):
     waiting_for_ref = State()
     waiting_for_deposit = State()
@@ -68,8 +70,14 @@ class AdminPostbacksState(StatesGroup):
     waiting_for_chat_id = State()
 
 
-# ===== HELPERS: DB & STATS =====
+class AdminBroadcastState(StatesGroup):
+    choosing_segment = State()
+    waiting_for_text = State()
+    waiting_for_media = State()
+    confirming = State()
 
+
+# ===== HELPERS: DB & STATS =====
 
 async def _get_or_create_settings() -> Settings:
     if db.async_session_maker is None:
@@ -111,7 +119,6 @@ async def _get_stats():
 
 
 # ===== HELPERS: UI =====
-
 
 async def _send_admin_menu(bot, chat_id: int) -> None:
     users_count, deposits_count, registrations_count, total_deposit = await _get_stats()
@@ -387,68 +394,198 @@ async def _send_postbacks_group_window(bot, chat_id: int) -> None:
     await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
 
 
-def _get_postback_base_url() -> str:
-    """
-    Базовый URL для постбэков берём из POSTBACK_BASE_URL,
-    чтобы в админке не руками писать IP+порт.
-    """
-    base = os.getenv("POSTBACK_BASE_URL", "").strip()
-    if not base:
-        base = "http://45.90.218.187:8000"
-    base = base.rstrip("/")
-    return base
+async def _send_postback_urls_window(bot, chat_id: int) -> None:
+    base_url = os.getenv("POSTBACK_BASE_URL", "").rstrip("/")
+    if not base_url:
+        text = (
+            "🔗 <b>URL постбэков для партнёрки</b>\n\n"
+            "POSTBACK_BASE_URL не задан в .env.\n"
+            "Пример: <code>POSTBACK_BASE_URL=http://45.90.218.187:8000</code>"
+        )
+    else:
+        reg_url = f"{base_url}/postback/registration?trader_id={{trader_id}}&click_id={{click_id}}"
+        ftd_url = f"{base_url}/postback/first_deposit?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
+        redep_url = f"{base_url}/postback/redeposit?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
+        wdr_url = f"{base_url}/postback/withdraw?trader_id={{trader_id}}&click_id={{click_id}}&wdr_sum={{wdr_sum}}"
 
-
-async def _send_postbacks_urls_window(bot, chat_id: int) -> None:
-    base = _get_postback_base_url()
-
-    reg_url = (
-        base
-        + "/postback/registration?trader_id={trader_id}&click_id={click_id}"
-    )
-    ftd_url = (
-        base
-        + "/postback/first_deposit?"
-        "trader_id={trader_id}&click_id={click_id}&sumdep={sumdep}"
-    )
-    redep_url = (
-        base
-        + "/postback/redeposit?"
-        "trader_id={trader_id}&click_id={click_id}&sumdep={sumdep}"
-    )
-    wdr_url = (
-        base
-        + "/postback/withdraw?"
-        "trader_id={trader_id}&click_id={click_id}&wdr_sum={wdr_sum}"
-    )
-
-    text = (
-        "🔗 <b>URL постбэков для партнёрки</b>\n\n"
-        f"Базовый адрес: <code>{base}</code>\n\n"
-        "<b>Регистрация:</b>\n"
-        f"<code>{reg_url}</code>\n\n"
-        "<b>Первый депозит (FTD):</b>\n"
-        f"<code>{ftd_url}</code>\n\n"
-        "<b>Повторный депозит:</b>\n"
-        f"<code>{redep_url}</code>\n\n"
-        "<b>Вывод средств:</b>\n"
-        f"<code>{wdr_url}</code>\n\n"
-        "📌 <b>Макросы</b>\n"
-        "• {trader_id} — ID трейдера у брокера\n"
-        "• {click_id} — Telegram ID (tg id)\n"
-        "• {sumdep} — сумма депозита\n"
-        "• {wdr_sum} — сумма вывода\n"
-    )
+        text = (
+            "🔗 <b>URL постбэков для партнёрки</b>\n\n"
+            f"Базовый адрес: <code>{base_url}</code>\n\n"
+            "Регистрация:\n"
+            f"<code>{reg_url}</code>\n\n"
+            "Первый депозит (FTD):\n"
+            f"<code>{ftd_url}</code>\n\n"
+            "Повторный депозит:\n"
+            f"<code>{redep_url}</code>\n\n"
+            "Вывод средств:\n"
+            f"<code>{wdr_url}</code>\n\n"
+            "📌 <b>Макросы</b>:\n"
+            "• {trader_id} — ID трейдера у брокера\n"
+            "• {click_id} — Telegram ID (tg id)\n"
+            "• {sumdep} — сумма депозита\n"
+            "• {wdr_sum} — сумма вывода\n"
+        )
 
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
     kb.adjust(1)
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
+
+
+# ===== BROADCAST HELPERS =====
+
+def _segment_human_name(segment: str) -> str:
+    if segment == "all":
+        return "Все пользователи"
+    if segment == "start":
+        return "Только /start (без регистрации и депозита)"
+    if segment == "reg":
+        return "Только регистрация (без депозита)"
+    if segment == "dep":
+        return "Только депозит"
+    return segment
+
+
+async def _get_broadcast_users(segment: str) -> List[User]:
+    """
+    Сегменты:
+    - all: все пользователи
+    - start: нет регистрации и нет депозитов
+    - reg: есть регистрация, нет депозитов
+    - dep: есть хотя бы один депозит
+    """
+    if db.async_session_maker is None:
+        return []
+
+    async with db.async_session_maker() as session:
+        if segment == "all":
+            res = await session.execute(select(User))
+            return list(res.scalars().all())
+
+        sum_dep = func.coalesce(func.sum(Deposit.amount), 0)
+
+        stmt = (
+            select(User, sum_dep.label("sum_dep"))
+            .outerjoin(Deposit, Deposit.user_id == User.id)
+            .group_by(User.id)
+        )
+
+        if segment == "start":
+            stmt = stmt.where(User.is_registered == False).having(sum_dep == 0)  # noqa: E712
+        elif segment == "reg":
+            stmt = stmt.where(User.is_registered == True).having(sum_dep == 0)  # noqa: E712
+        elif segment == "dep":
+            stmt = stmt.having(sum_dep > 0)
+
+        res = await session.execute(stmt)
+        users = [row[0] for row in res.all()]
+        return users
+
+
+async def _send_broadcast_segment_menu(bot, chat_id: int) -> None:
+    text = (
+        "📨 <b>Рассылка</b>\n\n"
+        "Выберите аудиторию:\n"
+        "1️⃣ Все пользователи\n"
+        "2️⃣ Только /start (без регистрации и депозита)\n"
+        "3️⃣ Только регистрация (без депозита)\n"
+        "4️⃣ Только депозит\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="1️⃣ Все пользователи", callback_data="admin:broadcast:seg:all")
+    kb.button(text="2️⃣ Только /start", callback_data="admin:broadcast:seg:start")
+    kb.button(text="3️⃣ Только регистрация", callback_data="admin:broadcast:seg:reg")
+    kb.button(text="4️⃣ Только депозит", callback_data="admin:broadcast:seg:dep")
+    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
+    kb.adjust(1, 1, 1, 1, 1)
 
     await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
 
 
-# ===== HANDLERS: /admin =====
+async def _send_broadcast_preview(bot, chat_id: int, data: dict) -> None:
+    segment = data.get("segment", "all")
+    text = data.get("text", "")
+    media_type = data.get("media_type")
+    file_id = data.get("file_id")
 
+    seg_name = _segment_human_name(segment)
+
+    # Превью основного контента
+    if media_type is None:
+        await bot.send_message(chat_id, text or "(пустой текст)")
+    elif media_type == "photo":
+        await bot.send_photo(chat_id, photo=file_id, caption=text or "")
+    elif media_type == "video":
+        await bot.send_video(chat_id, video=file_id, caption=text or "")
+    elif media_type == "video_note":
+        # кружок + сразу текст
+        await bot.send_video_note(chat_id, video_note=file_id)
+        await bot.send_message(chat_id, text or "")
+
+    # Сообщение с подтверждением
+    confirm_text = (
+        "✅ Проверяем настройки рассылки.\n\n"
+        f"<b>Аудитория:</b> {seg_name}\n"
+        f"<b>Текст:</b>\n{text or '(пустой текст)'}\n\n"
+        "Нажмите «Запустить», чтобы отправить."
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚀 Запустить", callback_data="admin:broadcast:start")
+    kb.button(text="✖️ Отмена", callback_data="admin:broadcast:cancel")
+    kb.adjust(1, 1)
+
+    await bot.send_message(chat_id, confirm_text, reply_markup=kb.as_markup())
+
+
+async def _run_broadcast(bot, admin_chat_id: int, data: dict) -> None:
+    segment = data.get("segment", "all")
+    text = data.get("text") or ""
+    media_type = data.get("media_type")
+    file_id = data.get("file_id")
+
+    users = await _get_broadcast_users(segment)
+    total = len(users)
+    if total == 0:
+        await bot.send_message(admin_chat_id, "Нет пользователей под этот сегмент.")
+        return
+
+    ok = 0
+    fail = 0
+
+    for user in users:
+        try:
+            chat_id = user.telegram_id
+            if not chat_id:
+                continue
+
+            if media_type is None:
+                await bot.send_message(chat_id, text)
+            elif media_type == "photo":
+                await bot.send_photo(chat_id, photo=file_id, caption=text)
+            elif media_type == "video":
+                await bot.send_video(chat_id, video=file_id, caption=text)
+            elif media_type == "video_note":
+                await bot.send_video_note(chat_id, video_note=file_id)
+                if text:
+                    await bot.send_message(chat_id, text)
+            ok += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            fail += 1
+        except Exception:
+            fail += 1
+
+    await bot.send_message(
+        admin_chat_id,
+        f"📨 Рассылка завершена.\n\n"
+        f"Сегмент: {_segment_human_name(segment)}\n"
+        f"Всего пользователей: {total}\n"
+        f"Отправлено успешно: {ok}\n"
+        f"Ошибок: {fail}",
+    )
+
+
+# ===== HANDLERS: /admin =====
 
 @router.message(Command("admin"))
 async def admin_entry(message: Message) -> None:
@@ -482,7 +619,6 @@ async def admin_menu_from_callback(callback: CallbackQuery) -> None:
 
 
 # ===== HANDLERS: ССЫЛКИ =====
-
 
 @router.callback_query(F.data == "admin:links")
 async def admin_links(callback: CallbackQuery, state: FSMContext) -> None:
@@ -690,8 +826,7 @@ async def admin_links_set_support(message: Message, state: FSMContext) -> None:
     await _send_links_window(message.bot, message.chat.id)
 
 
-# ===== HANDЛERS: НАСТРОЙКИ =====
-
+# ===== HANDLERS: НАСТРОЙКИ =====
 
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(callback: CallbackQuery, state: FSMContext) -> None:
@@ -872,8 +1007,7 @@ async def admin_steps_set_vip_amount(message: Message, state: FSMContext) -> Non
     await _send_steps_window(message.bot, message.chat.id)
 
 
-# ===== HANDLERS: ПОСТБЭКИ В ГРУППУ =====
-
+# ===== HANDЛERS: ПОСТБЭКИ В ГРУППУ =====
 
 @router.callback_query(F.data == "admin:settings:postbacks_group")
 async def admin_postbacks_group(callback: CallbackQuery, state: FSMContext) -> None:
@@ -940,9 +1074,7 @@ async def admin_postbacks_group_toggle(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "admin:postbacks_group:edit:chat")
-async def admin_postbacks_group_edit_chat(
-    callback: CallbackQuery, state: FSMContext
-) -> None:
+async def admin_postbacks_group_edit_chat(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user is None or not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -1000,9 +1132,8 @@ async def admin_postbacks_group_set_chat(message: Message, state: FSMContext) ->
 
 # ===== HANDЛЕР: ОКНО URL ПОСТБЭКОВ =====
 
-
 @router.callback_query(F.data == "admin:postbacks")
-async def admin_postbacks(callback: CallbackQuery) -> None:
+async def admin_postbacks_urls(callback: CallbackQuery) -> None:
     if callback.from_user is None or not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -1014,11 +1145,181 @@ async def admin_postbacks(callback: CallbackQuery) -> None:
             pass
 
     chat_id = callback.message.chat.id if callback.message else callback.from_user.id
-    await _send_postbacks_urls_window(callback.message.bot, chat_id)
+    await _send_postback_urls_window(callback.message.bot, chat_id)
+
+
+# ===== HANDЛЕРЫ: РАССЫЛКА =====
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_entry(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_broadcast_segment_menu(callback.message.bot, chat_id)
+
+
+@router.callback_query(F.data.startswith("admin:broadcast:seg:"))
+async def admin_broadcast_choose_segment(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    _, _, _, segment = data.split(":", 3)
+
+    await state.update_data(segment=segment)
+    await state.set_state(AdminBroadcastState.waiting_for_text)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    seg_name = _segment_human_name(segment)
+    text = (
+        f"📨 <b>Рассылка</b>\n\n"
+        f"Аудитория: <b>{seg_name}</b>\n\n"
+        "Отправьте текст рассылки одним сообщением.\n"
+        "Черновики не сохраняются."
+    )
+    await callback.message.bot.send_message(callback.from_user.id, text)
+
+
+@router.message(AdminBroadcastState.waiting_for_text)
+async def admin_broadcast_get_text(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    text = (message.html_text or message.text or "").strip()
+    if not text:
+        await message.answer("Текст пустой. Отправьте, пожалуйста, текст рассылки.")
+        return
+
+    await state.update_data(text=text)
+    await state.set_state(AdminBroadcastState.waiting_for_media)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Без медиа", callback_data="admin:broadcast:no_media")
+    kb.button(text="✖️ Отмена", callback_data="admin:broadcast:cancel")
+    kb.adjust(1, 1)
+
+    await message.answer(
+        "Если нужно, пришлите <b>фото/видео/кружок</b> одним сообщением.\n\n"
+        "Или нажмите «Без медиа».",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast:no_media")
+async def admin_broadcast_no_media(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = await state.get_data()
+    if not data.get("text") or not data.get("segment"):
+        await callback.answer("Данные рассылки потеряны, начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    await state.set_state(AdminBroadcastState.confirming)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    await _send_broadcast_preview(callback.message.bot, callback.from_user.id, data)
+
+
+@router.message(AdminBroadcastState.waiting_for_media)
+async def admin_broadcast_get_media(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    if not data.get("text") or not data.get("segment"):
+        await message.answer("Данные рассылки потеряны, начните заново через /admin.")
+        await state.clear()
+        return
+
+    media_type = None
+    file_id = None
+
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+    elif message.video_note:
+        media_type = "video_note"
+        file_id = message.video_note.file_id
+
+    if not media_type or not file_id:
+        await message.answer("Нужно отправить фото, видео или видеосообщение (кружок).")
+        return
+
+    data["media_type"] = media_type
+    data["file_id"] = file_id
+    await state.update_data(media_type=media_type, file_id=file_id)
+    await state.set_state(AdminBroadcastState.confirming)
+
+    await _send_broadcast_preview(message.bot, message.from_user.id, data)
+
+
+@router.callback_query(F.data == "admin:broadcast:start")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = await state.get_data()
+    if not data.get("segment") or not data.get("text"):
+        await callback.answer("Данные рассылки потеряны, начните заново.", show_alert=True)
+        await state.clear()
+        return
+
+    await callback.answer("Запускаю рассылку...", show_alert=False)
+
+    admin_chat_id = callback.from_user.id
+    await _run_broadcast(callback.message.bot, admin_chat_id, data)
+
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin:broadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.answer("Рассылка отменена.", show_alert=False)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_admin_menu(callback.message.bot, chat_id)
 
 
 # ===== HANDЛЕРЫ: ПОЛЬЗОВАТЕЛИ =====
-
 
 @router.callback_query(F.data == "admin:users")
 async def admin_users(callback: CallbackQuery) -> None:
@@ -1222,15 +1523,6 @@ async def admin_user_actions(callback: CallbackQuery) -> None:
 
 
 # ===== ПРОЧИЕ КНОПКИ =====
-
-
-@router.callback_query(F.data == "admin:broadcast")
-async def admin_broadcast_stub(callback: CallbackQuery) -> None:
-    if callback.from_user is None or not _is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.answer("Рассылку сделаем позже.", show_alert=True)
-
 
 @router.callback_query(F.data == "admin:users:noop")
 async def admin_users_noop(callback: CallbackQuery) -> None:
