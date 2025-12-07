@@ -329,6 +329,17 @@ def _get_miniapp_url_for_user(user: Optional[User]) -> Optional[str]:
     return None
 
 
+def _add_click_id(url: Optional[str], tg_id: int | str) -> str:
+    """
+    Добавляет к ссылке параметр click_id=<tg_id>, чтобы постбэк знал Telegram ID.
+    Если url пустой — возвращаем пустую строку.
+    """
+    if not url:
+        return ""
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}click_id={tg_id}"
+
+
 async def _get_or_create_user(tg_id: int, username: Optional[str] = None) -> User:
     if db.async_session_maker is None:
         raise RuntimeError("DB not initialized")
@@ -470,26 +481,32 @@ def _subscribe_markup(lang: str, channel_url: Optional[str]):
     return kb.as_markup()
 
 
-def _registration_markup(lang: str, ref_link: Optional[str]):
+def _registration_markup(lang: str, ref_link: Optional[str], tg_id: Optional[int] = None):
     labels = get_labels(lang)
     kb = InlineKeyboardBuilder()
     if ref_link:
+        url = _add_click_id(ref_link, tg_id) if tg_id is not None else ref_link
         kb.button(
             text="📝 Зарегистрироваться" if lang == "ru" else "📝 Register",
-            url=ref_link,
+            url=url,
         )
     kb.button(text=labels["back_to_menu"], callback_data="menu:back_to_menu")
     kb.adjust(1, 1)
     return kb.as_markup()
 
 
-def _deposit_markup(lang: str, deposit_link: Optional[str]):
+def _deposit_markup(
+    lang: str,
+    deposit_link: Optional[str],
+    tg_id: Optional[int] = None,
+):
     labels = get_labels(lang)
     kb = InlineKeyboardBuilder()
     if deposit_link:
+        url = _add_click_id(deposit_link, tg_id) if tg_id is not None else deposit_link
         kb.button(
             text="💰 Сделать депозит" if lang == "ru" else "💰 Make deposit",
-            url=deposit_link,
+            url=url,
         )
     kb.button(text=labels["back_to_menu"], callback_data="menu:back_to_menu")
     kb.adjust(1, 1)
@@ -523,13 +540,18 @@ def _access_opened_markup(lang: str, user: User):
     return kb.as_markup()
 
 
-def _limited_markup(lang: str, deposit_link: Optional[str]):
+def _limited_markup(
+    lang: str,
+    deposit_link: Optional[str],
+    tg_id: Optional[int] = None,
+):
     labels = get_labels(lang)
     kb = InlineKeyboardBuilder()
     if deposit_link:
+        url = _add_click_id(deposit_link, tg_id) if tg_id is not None else deposit_link
         kb.button(
             text="💰 Сделать депозит" if lang == "ru" else "💰 Make deposit",
-            url=deposit_link,
+            url=url,
         )
     kb.button(text=labels["back_to_menu"], callback_data="menu:back_to_menu")
     kb.adjust(1, 1)
@@ -569,7 +591,7 @@ async def notify_basic_access_limited(bot: Bot, tg_id: int) -> None:
     required = float(settings.deposit_required_amount or 0)
     text_tpl = LIMITED_BASIC_TEXT.get(lang, LIMITED_BASIC_TEXT["en"])
     text = text_tpl.format(required=required)
-    markup = _limited_markup(lang, settings.deposit_link)
+    markup = _limited_markup(lang, settings.deposit_link, tg_id=tg_id)
 
     img_path = _get_image_path(lang, "deposit")
     if img_path:
@@ -589,7 +611,7 @@ async def notify_vip_access_limited(bot: Bot, tg_id: int) -> None:
     vip_thr = float(settings.vip_threshold_amount or 0)
     text_tpl = LIMITED_VIP_TEXT.get(lang, LIMITED_VIP_TEXT["en"])
     text = text_tpl.format(vip=vip_thr)
-    markup = _limited_markup(lang, settings.deposit_link)
+    markup = _limited_markup(lang, settings.deposit_link, tg_id=tg_id)
 
     img_path = _get_image_path(lang, "deposit")
     if img_path:
@@ -750,7 +772,7 @@ async def _run_flow(bot: Bot, chat_id: int, tg_id: int) -> None:
             return
 
         text = REGISTRATION_TEXT.get(lang, REGISTRATION_TEXT["en"])
-        markup = _registration_markup(lang, settings.ref_link)
+        markup = _registration_markup(lang, settings.ref_link, tg_id=tg_id)
         img_path = _get_image_path(lang, "registration")
         if img_path:
             await bot.send_photo(
@@ -783,7 +805,7 @@ async def _run_flow(bot: Bot, chat_id: int, tg_id: int) -> None:
 
             text_tpl = DEPOSIT_TEXT.get(lang, DEPOSIT_TEXT["en"])
             text = text_tpl.format(required=required_dep, current=total_deposit)
-            markup = _deposit_markup(lang, settings.deposit_link)
+            markup = _deposit_markup(lang, settings.deposit_link, tg_id=tg_id)
             img_path = _get_image_path(lang, "deposit")
             if img_path:
                 await bot.send_photo(
