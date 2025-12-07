@@ -1,5 +1,3 @@
-# postback_app.py
-
 from __future__ import annotations
 
 import logging
@@ -55,7 +53,7 @@ app = FastAPI(title="Jogoto postbacks")
 async def check_secret(request: Request) -> None:
     """
     Если BROKER_POSTBACK_SECRET задан, проверяем его либо в query ?secret=,
-    либо в заголовке X-Postback-Secret. Если не задан — ничего не проверяем.
+    либо в заголовке X-Postback-Secret. Если пустой — ничего не проверяем.
     """
     if not POSTBACK_SECRET:
         return
@@ -138,11 +136,8 @@ async def send_postback_to_group(
 
 async def extract_params(request: Request) -> Dict[str, Any]:
     """
-    Собираем параметры из:
-    - query (?trader_id=...&click_id=...)
-    - формы (POST application/x-www-form-urlencoded / multipart)
-    - JSON (POST application/json)
-    И логируем всё, что видим.
+    Собираем параметры из query, form и json.
+    Логируем всё, чтобы видеть, что реально шлёт партнёрка.
     """
     params: Dict[str, Any] = {}
 
@@ -150,7 +145,6 @@ async def extract_params(request: Request) -> Dict[str, Any]:
     for k, v in request.query_params.items():
         params[k] = v
 
-    # заголовки + url + метод
     logger.info(
         "Incoming %s %s from %s | query=%s | headers=%s",
         request.method,
@@ -160,7 +154,6 @@ async def extract_params(request: Request) -> Dict[str, Any]:
         dict(request.headers),
     )
 
-    # тело
     raw_body: bytes = b""
     try:
         raw_body = await request.body()
@@ -169,7 +162,6 @@ async def extract_params(request: Request) -> Dict[str, Any]:
     except Exception as e:
         logger.error("Error reading body: %s", e)
 
-    # пробуем распарсить form/json
     ct = (request.headers.get("content-type") or "").lower()
     try:
         if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
@@ -227,18 +219,17 @@ async def root() -> str:
 async def postback_registration(request: Request):
     """
     Регистрация:
-    trader_id={{trader_id}}
-    click_id={{click_id}}  (tg id)
+    trader_id={trader_id}
+    click_id={click_id}  (tg id)
     """
     await check_secret(request)
-
     params = await extract_params(request)
+
     trader_id = params.get("trader_id")
     click_id = params.get("click_id")
 
     if not trader_id or not click_id:
         logger.warning("Missing trader_id or click_id in registration: %s", params)
-        # Отдаём 200, чтобы не злить партнёрку, но логируем
         return PlainTextResponse("MISSING_PARAMS", status_code=200)
 
     try:
@@ -262,7 +253,6 @@ async def postback_registration(request: Request):
             select(User).where(User.telegram_id == tg_id)
         )
         user: Optional[User] = result.scalar_one_or_none()
-
         if user is None:
             user = User(telegram_id=tg_id)
             session.add(user)
@@ -272,13 +262,11 @@ async def postback_registration(request: Request):
 
         await session.commit()
 
-    # автопуш следующего шага / доступа
     try:
         await run_access_flow_for_user(bot, tg_id)
     except Exception as e:
         logger.error("run_access_flow_for_user error after registration: %s", e)
 
-    # отстук в группу (если включено)
     await send_postback_to_group("registration", str(trader_id), tg_id)
 
     return PlainTextResponse("OK")
@@ -293,8 +281,8 @@ async def _handle_deposit_common(
     event_name: str,
 ):
     await check_secret(request)
-
     params = await extract_params(request)
+
     trader_id = params.get("trader_id")
     click_id = params.get("click_id")
     sumdep_raw = params.get("sumdep")
@@ -334,7 +322,6 @@ async def _handle_deposit_common(
     became_vip = False
 
     async with db.async_session_maker() as session:
-        # находим / создаём пользователя
         result = await session.execute(
             select(User).where(User.telegram_id == tg_id)
         )
@@ -346,11 +333,9 @@ async def _handle_deposit_common(
         if trader_id and not user.trader_id:
             user.trader_id = str(trader_id)
 
-        # пишем депозит
         dep = Deposit(user_id=user.id, amount=float(sumdep))
         session.add(dep)
 
-        # считаем сумму всех депозитов
         total_dep = await session.scalar(
             select(func.coalesce(func.sum(Deposit.amount), 0.0)).where(
                 Deposit.user_id == user.id
@@ -358,7 +343,6 @@ async def _handle_deposit_common(
         )
         total_dep = float(total_dep or 0.0)
 
-        # получаем настройки (в этой же сессии)
         settings = await session.get(Settings, 1)
         if settings is None:
             settings = Settings(id=1)
@@ -372,20 +356,17 @@ async def _handle_deposit_common(
 
         await session.commit()
 
-    # автопуш следующего шага / доступа
     try:
         await run_access_flow_for_user(bot, tg_id)
     except Exception as e:
         logger.error("run_access_flow_for_user error after deposit: %s", e)
 
-    # если новый VIP — отдельное уведомление
     if became_vip:
         try:
             await notify_vip_granted(bot, tg_id)
         except Exception as e:
             logger.error("notify_vip_granted error: %s", e)
 
-    # отстук в группу
     await send_postback_to_group("deposit", str(trader_id), tg_id, amount=float(sumdep))
 
     return PlainTextResponse("OK")
@@ -394,20 +375,12 @@ async def _handle_deposit_common(
 @app.get("/postback/first_deposit")
 @app.post("/postback/first_deposit")
 async def postback_first_deposit(request: Request):
-    """
-    Первый депозит (FTD):
-    trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}
-    """
     return await _handle_deposit_common(request=request, event_name="first_deposit")
 
 
 @app.get("/postback/redeposit")
 @app.post("/postback/redeposit")
 async def postback_redeposit(request: Request):
-    """
-    Повторный депозит:
-    trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}
-    """
     return await _handle_deposit_common(request=request, event_name="redeposit")
 
 
@@ -418,14 +391,9 @@ async def postback_redeposit(request: Request):
 @app.get("/postback/withdraw")
 @app.post("/postback/withdraw")
 async def postback_withdraw(request: Request):
-    """
-    Вывод средств:
-    trader_id={{trader_id}}&click_id={{click_id}}&wdr_sum={{wdr_sum}}
-    Сейчас мы не пишем выводы в БД, только отстук в группу.
-    """
     await check_secret(request)
-
     params = await extract_params(request)
+
     trader_id = params.get("trader_id")
     click_id = params.get("click_id")
     wdr_raw = params.get("wdr_sum")
@@ -457,3 +425,18 @@ async def postback_withdraw(request: Request):
     await send_postback_to_group("withdraw", str(trader_id), tg_id, amount=float(wdr_sum))
 
     return PlainTextResponse("OK")
+
+
+# -------------------------------------------------
+# CATCH-ALL /postback/*
+# -------------------------------------------------
+
+@app.api_route("/postback/{tail:path}", methods=["GET", "POST"])
+async def postback_catch_all(tail: str, request: Request):
+    """
+    На случай, если в партнёрке путь кривой (например /postback/reg или просто /postback).
+    Мы это логируем и отвечаем OK, чтобы увидеть, что вообще прилетело.
+    """
+    params = await extract_params(request)
+    logger.info("CATCH-ALL /postback/%s params=%s", tail, params)
+    return PlainTextResponse("OK (catch-all)")
