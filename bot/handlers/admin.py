@@ -5,14 +5,11 @@ from typing import Optional
 
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-)
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func
 
 from ..models import base as db
 from ..models.user import User
@@ -29,6 +26,7 @@ router = Router()
 
 
 # ===== ADMIN ACCESS =====
+
 
 def _load_admin_ids() -> set[int]:
     raw = os.getenv("ADMIN_IDS", "")
@@ -50,55 +48,8 @@ def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ===== POSTBACK URL HELPERS =====
-
-def _get_postback_base_url() -> str:
-    """
-    Базовый URL для постбэков, например:
-    http://45.90.218.187:8000
-    Берётся из POSTBACK_BASE_URL в .env
-    """
-    base = os.getenv("POSTBACK_BASE_URL", "").strip()
-    if not base:
-        return ""
-    return base.rstrip("/")
-
-
-def _build_postback_urls() -> dict[str, str]:
-    """
-    Собираем готовые URL для партнёрки с нужными макросами.
-    Макросы:
-        {trader_id}, {click_id}, {sumdep}, {wdr_sum}
-    """
-    base = _get_postback_base_url()
-    if not base:
-        return {}
-
-    return {
-        # регистрация: trader_id + click_id (tg id)
-        "registration": (
-            f"{base}/postback/registration"
-            "?trader_id={{trader_id}}&click_id={{click_id}}"
-        ),
-        # первый депозит: trader_id + click_id + sumdep
-        "ftd": (
-            f"{base}/postback/first_deposit"
-            "?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
-        ),
-        # повторный депозит: trader_id + click_id + sumdep
-        "redep": (
-            f"{base}/postback/redeposit"
-            "?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
-        ),
-        # вывод: trader_id + click_id + wdr_sum
-        "withdraw": (
-            f"{base}/postback/withdraw"
-            "?trader_id={{trader_id}}&click_id={{click_id}}&wdr_sum={{wdr_sum}}"
-        ),
-    }
-
-
 # ===== STATES =====
+
 
 class AdminLinksState(StatesGroup):
     waiting_for_ref = State()
@@ -118,6 +69,7 @@ class AdminPostbacksState(StatesGroup):
 
 
 # ===== HELPERS: DB & STATS =====
+
 
 async def _get_or_create_settings() -> Settings:
     if db.async_session_maker is None:
@@ -159,6 +111,7 @@ async def _get_stats():
 
 
 # ===== HELPERS: UI =====
+
 
 async def _send_admin_menu(bot, chat_id: int) -> None:
     users_count, deposits_count, registrations_count, total_deposit = await _get_stats()
@@ -434,7 +387,68 @@ async def _send_postbacks_group_window(bot, chat_id: int) -> None:
     await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
 
 
+def _get_postback_base_url() -> str:
+    """
+    Базовый URL для постбэков берём из POSTBACK_BASE_URL,
+    чтобы в админке не руками писать IP+порт.
+    """
+    base = os.getenv("POSTBACK_BASE_URL", "").strip()
+    if not base:
+        base = "http://45.90.218.187:8000"
+    base = base.rstrip("/")
+    return base
+
+
+async def _send_postbacks_urls_window(bot, chat_id: int) -> None:
+    base = _get_postback_base_url()
+
+    reg_url = (
+        base
+        + "/postback/registration?trader_id={trader_id}&click_id={click_id}"
+    )
+    ftd_url = (
+        base
+        + "/postback/first_deposit?"
+        "trader_id={trader_id}&click_id={click_id}&sumdep={sumdep}"
+    )
+    redep_url = (
+        base
+        + "/postback/redeposit?"
+        "trader_id={trader_id}&click_id={click_id}&sumdep={sumdep}"
+    )
+    wdr_url = (
+        base
+        + "/postback/withdraw?"
+        "trader_id={trader_id}&click_id={click_id}&wdr_sum={wdr_sum}"
+    )
+
+    text = (
+        "🔗 <b>URL постбэков для партнёрки</b>\n\n"
+        f"Базовый адрес: <code>{base}</code>\n\n"
+        "<b>Регистрация:</b>\n"
+        f"<code>{reg_url}</code>\n\n"
+        "<b>Первый депозит (FTD):</b>\n"
+        f"<code>{ftd_url}</code>\n\n"
+        "<b>Повторный депозит:</b>\n"
+        f"<code>{redep_url}</code>\n\n"
+        "<b>Вывод средств:</b>\n"
+        f"<code>{wdr_url}</code>\n\n"
+        "📌 <b>Макросы</b>\n"
+        "• {trader_id} — ID трейдера у брокера\n"
+        "• {click_id} — Telegram ID (tg id)\n"
+        "• {sumdep} — сумма депозита\n"
+        "• {wdr_sum} — сумма вывода\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
+    kb.adjust(1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
+
+
 # ===== HANDLERS: /admin =====
+
 
 @router.message(Command("admin"))
 async def admin_entry(message: Message) -> None:
@@ -468,6 +482,7 @@ async def admin_menu_from_callback(callback: CallbackQuery) -> None:
 
 
 # ===== HANDLERS: ССЫЛКИ =====
+
 
 @router.callback_query(F.data == "admin:links")
 async def admin_links(callback: CallbackQuery, state: FSMContext) -> None:
@@ -675,7 +690,8 @@ async def admin_links_set_support(message: Message, state: FSMContext) -> None:
     await _send_links_window(message.bot, message.chat.id)
 
 
-# ===== HANDLERS: НАСТРОЙКИ =====
+# ===== HANDЛERS: НАСТРОЙКИ =====
+
 
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(callback: CallbackQuery, state: FSMContext) -> None:
@@ -858,6 +874,7 @@ async def admin_steps_set_vip_amount(message: Message, state: FSMContext) -> Non
 
 # ===== HANDLERS: ПОСТБЭКИ В ГРУППУ =====
 
+
 @router.callback_query(F.data == "admin:settings:postbacks_group")
 async def admin_postbacks_group(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user is None or not _is_admin(callback.from_user.id):
@@ -923,7 +940,9 @@ async def admin_postbacks_group_toggle(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "admin:postbacks_group:edit:chat")
-async def admin_postbacks_group_edit_chat(callback: CallbackQuery, state: FSMContext) -> None:
+async def admin_postbacks_group_edit_chat(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
     if callback.from_user is None or not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -979,7 +998,27 @@ async def admin_postbacks_group_set_chat(message: Message, state: FSMContext) ->
     await _send_postbacks_group_window(message.bot, message.chat.id)
 
 
-# ===== HANDLERS: ПОЛЬЗОВАТЕЛИ =====
+# ===== HANDЛЕР: ОКНО URL ПОСТБЭКОВ =====
+
+
+@router.callback_query(F.data == "admin:postbacks")
+async def admin_postbacks(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_postbacks_urls_window(callback.message.bot, chat_id)
+
+
+# ===== HANDЛЕРЫ: ПОЛЬЗОВАТЕЛИ =====
+
 
 @router.callback_query(F.data == "admin:users")
 async def admin_users(callback: CallbackQuery) -> None:
@@ -1183,61 +1222,6 @@ async def admin_user_actions(callback: CallbackQuery) -> None:
 
 
 # ===== ПРОЧИЕ КНОПКИ =====
-
-@router.callback_query(F.data == "admin:postbacks")
-async def admin_postbacks_window(callback: CallbackQuery) -> None:
-    """
-    Окно с готовыми URL для постбэков + описание макросов.
-    """
-    if callback.from_user is None or not _is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    base = _get_postback_base_url()
-    urls = _build_postback_urls() if base else {}
-
-    if not base:
-        text = (
-            "⚠️ <b>URL постбэков</b>\n\n"
-            "Базовый адрес не настроен.\n\n"
-            "Добавь в <code>.env</code> строку, например:\n"
-            "<code>POSTBACK_BASE_URL=http://45.90.218.187:8000</code>\n"
-        )
-    else:
-        text = (
-            "🔗 <b>URL постбэков для партнёрки</b>\n\n"
-            f"Базовый адрес: <code>{base}</code>\n\n"
-            "Регистрация:\n"
-            f"<code>{urls['registration']}</code>\n\n"
-            "Первый депозит (FTD):\n"
-            f"<code>{urls['ftd']}</code>\n\n"
-            "Повторный депозит:\n"
-            f"<code>{urls['redep']}</code>\n\n"
-            "Вывод средств:\n"
-            f"<code>{urls['withdraw']}</code>\n\n"
-            "📌 <b>Макросы</b>\n"
-            "• <code>{trader_id}</code> — ID трейдера у брокера\n"
-            "• <code>{click_id}</code> — Telegram ID (tg id)\n"
-            "• <code>{sumdep}</code> — сумма депозита\n"
-            "• <code>{wdr_sum}</code> — сумма вывода\n"
-        )
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
-    kb.adjust(1)
-
-    if callback.message:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-
-    await callback.message.bot.send_message(
-        callback.from_user.id,
-        text,
-        reply_markup=kb.as_markup(),
-        disable_web_page_preview=True,
-    )
 
 
 @router.callback_query(F.data == "admin:broadcast")
