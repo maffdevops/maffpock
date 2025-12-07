@@ -3,16 +3,16 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, func
-
-from bot.models import base as db
-from bot.models.user import User
-from bot.models.deposit import Deposit
-from bot.models.settings import Settings
+from sqlalchemy import select
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 
+from bot.config import load_config
+from bot.models import base as db
+from bot.models.user import User
+from bot.models.deposit import Deposit
+from bot.models.settings import Settings
 from bot.handlers.main_menu import run_access_flow_for_user
 
 app = FastAPI(title="Jogoto Postbacks")
@@ -22,7 +22,6 @@ app = FastAPI(title="Jogoto Postbacks")
 BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
 BROKER_POSTBACK_SECRET = os.getenv("BROKER_POSTBACK_SECRET") or ""
 
-# aiogram-бот, которым будем стучаться в группу постбэков и к юзерам
 bot: Optional[Bot] = None
 
 
@@ -64,10 +63,10 @@ async def _find_user_by_click_id(session, click_id: str) -> Optional[User]:
 
 async def _send_postback_message_to_group(
     text: str,
+    event: Optional[str] = None,  # "registration" | "deposit" | "withdraw"
 ) -> None:
     """
-    Отправка уведомления о постбэке в телеграм-группу, если она задана
-    и включён соответствующий флаг.
+    Отправка уведомления в чат постбэков с учётом флагов settings.send_postbacks_*.
     """
     if bot is None:
         return
@@ -82,11 +81,19 @@ async def _send_postback_message_to_group(
         if not chat_id:
             return
 
-        # просто отправляем текст, ошибок не роняем
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            pass
+        # уважаем флаги
+        if event == "registration" and not settings.send_postbacks_registration:
+            return
+        if event == "deposit" and not settings.send_postbacks_deposit:
+            return
+        if event == "withdraw" and not settings.send_postbacks_withdraw:
+            return
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        # не роняем приложение из-за ошибки отправки
+        pass
 
 
 # ===== FASTAPI LIFECYCLE =====
@@ -95,7 +102,11 @@ async def _send_postback_message_to_group(
 async def on_startup() -> None:
     global bot
 
+    # грузим конфиг так же, как бот
+    config = load_config()
+
     # инициализируем БД
+    db.setup_db(config.db.url)
     await db.init_db()
 
     # поднимаем aiogram-бота для уведомлений
@@ -122,16 +133,12 @@ async def root():
 
 
 # ===== POSTBACK ENDPOINTS =====
-# URL’ы полностью совпадают с теми, что ты видишь в админке
-#
 #   /postback/registration
 #   /postback/first_deposit
 #   /postback/redeposit
 #   /postback/withdraw
-#
 # Макросы:
-#   trader_id, click_id (tg id), sumdep, wdr_sum
-#   + опционально ?secret=... если BROKER_POSTBACK_SECRET задан
+#   trader_id, click_id (tg id), sumdep, wdr_sum, + secret (если нужен)
 # ================================
 
 @app.get("/postback/registration")
@@ -150,38 +157,35 @@ async def postback_registration(
         user = await _find_user_by_click_id(session, click_id)
 
         if user is None:
-            # юзера нет в базе – просто зафиксируем в ответе и, при желании, в группу
             await _send_postback_message_to_group(
                 text=(
                     "⚠️ Регистрация без найденного пользователя в БД\n"
                     f"trader_id: <code>{trader_id}</code>\n"
                     f"click_id (tg id): <code>{click_id}</code>"
-                )
+                ),
+                event="registration",
             )
             return JSONResponse(
                 {"status": "no_user", "trader_id": trader_id, "click_id": click_id}
             )
 
-        # обновляем данные юзера
         user.trader_id = trader_id
         user.is_registered = True
         await session.commit()
 
-        # постбэк в группу, если включено
         await _send_postback_message_to_group(
             text=(
                 "🟢 <b>Регистрация</b>\n"
                 f"trader_id: <code>{trader_id}</code>\n"
                 f"tg id: <code>{click_id}</code>"
-            )
+            ),
+            event="registration",
         )
 
-        # запускаем флоу шага доступа (подписка/рег/деп/доступ открыт)
         try:
             if bot is not None:
                 await run_access_flow_for_user(bot, user.telegram_id)
         except Exception:
-            # на проде лучше логировать, но падать из-за этого не нужно
             pass
 
     return {"status": "ok"}
@@ -237,7 +241,8 @@ async def _handle_deposit_postback(
                     f"trader_id: <code>{trader_id}</code>\n"
                     f"click_id (tg id): <code>{click_id}</code>\n"
                     f"sumdep: <b>{amount:.2f}$</b>"
-                )
+                ),
+                event="deposit",
             )
             return JSONResponse(
                 {
@@ -249,22 +254,20 @@ async def _handle_deposit_postback(
                 }
             )
 
-        # создаём запись депозита
         dep = Deposit(user_id=user.id, amount=float(amount))
         session.add(dep)
         await session.commit()
 
-        # постбэк в группу
         await _send_postback_message_to_group(
             text=(
                 f"💰 <b>Депозит ({kind})</b>\n"
                 f"trader_id: <code>{trader_id}</code>\n"
                 f"tg id: <code>{click_id}</code>\n"
                 f"Сумма: <b>{amount:.2f}$</b>"
-            )
+            ),
+            event="deposit",
         )
 
-        # прогоняем флоу доступа / VIP
         try:
             if bot is not None:
                 await run_access_flow_for_user(bot, user.telegram_id)
@@ -290,14 +293,14 @@ async def postback_withdraw(
     if not _check_secret(secret):
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # здесь мы пока ничего в БД не пишем, только уведомляем в группу
     await _send_postback_message_to_group(
         text=(
             "📤 <b>Вывод средств</b>\n"
             f"trader_id: <code>{trader_id}</code>\n"
             f"tg id: <code>{click_id}</code>\n"
             f"Сумма: <b>{wdr_sum:.2f}$</b>"
-        )
+        ),
+        event="withdraw",
     )
 
     return {
