@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -136,6 +136,66 @@ async def send_postback_to_group(
         logger.error("Failed to send postback to group: %s", e)
 
 
+async def extract_params(request: Request) -> Dict[str, Any]:
+    """
+    Собираем параметры из:
+    - query (?trader_id=...&click_id=...)
+    - формы (POST application/x-www-form-urlencoded / multipart)
+    - JSON (POST application/json)
+    И логируем всё, что видим.
+    """
+    params: Dict[str, Any] = {}
+
+    # query
+    for k, v in request.query_params.items():
+        params[k] = v
+
+    # заголовки + url + метод
+    logger.info(
+        "Incoming %s %s from %s | query=%s | headers=%s",
+        request.method,
+        request.url,
+        request.client.host if request.client else "unknown",
+        dict(request.query_params),
+        dict(request.headers),
+    )
+
+    # тело
+    raw_body: bytes = b""
+    try:
+        raw_body = await request.body()
+        if raw_body:
+            logger.info("Raw body: %s", raw_body.decode(errors="ignore"))
+    except Exception as e:
+        logger.error("Error reading body: %s", e)
+
+    # пробуем распарсить form/json
+    ct = (request.headers.get("content-type") or "").lower()
+    try:
+        if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+            form = await request.form()
+            form_dict = {k: v for k, v in form.items()}
+            logger.info("Parsed form: %s", form_dict)
+            for k, v in form_dict.items():
+                if k not in params:
+                    params[k] = v
+        elif "application/json" in ct and raw_body:
+            try:
+                json_data = await request.json()
+                if isinstance(json_data, dict):
+                    logger.info("Parsed json: %s", json_data)
+                    for k, v in json_data.items():
+                        if k not in params:
+                            params[k] = v
+            except Exception as e:
+                logger.error("Error parsing json: %s", e)
+    except Exception as e:
+        logger.error("Error parsing structured body (form/json): %s", e)
+
+    logger.info("Final extracted params: %s", params)
+    return params
+
+
 # -------------------------------------------------
 # Startup
 # -------------------------------------------------
@@ -164,11 +224,7 @@ async def root() -> str:
 
 @app.get("/postback/registration")
 @app.post("/postback/registration")
-async def postback_registration(
-    request: Request,
-    trader_id: str,
-    click_id: str,
-):
+async def postback_registration(request: Request):
     """
     Регистрация:
     trader_id={{trader_id}}
@@ -176,18 +232,27 @@ async def postback_registration(
     """
     await check_secret(request)
 
-    logger.info(
-        "POSTBACK registration: trader_id=%s click_id=%s from %s",
-        trader_id,
-        click_id,
-        request.client.host if request.client else "unknown",
-    )
+    params = await extract_params(request)
+    trader_id = params.get("trader_id")
+    click_id = params.get("click_id")
+
+    if not trader_id or not click_id:
+        logger.warning("Missing trader_id or click_id in registration: %s", params)
+        # Отдаём 200, чтобы не злить партнёрку, но логируем
+        return PlainTextResponse("MISSING_PARAMS", status_code=200)
 
     try:
-        tg_id = int(click_id)
+        tg_id = int(str(click_id))
     except ValueError:
         logger.warning("Invalid click_id for registration: %s", click_id)
-        raise HTTPException(status_code=400, detail="Bad click_id")
+        return PlainTextResponse("BAD_CLICK_ID", status_code=200)
+
+    logger.info(
+        "POSTBACK registration parsed: trader_id=%s click_id=%s (tg_id=%s)",
+        trader_id,
+        click_id,
+        tg_id,
+    )
 
     if db.async_session_maker is None:
         raise HTTPException(status_code=500, detail="DB not initialized")
@@ -199,12 +264,10 @@ async def postback_registration(
         user: Optional[User] = result.scalar_one_or_none()
 
         if user is None:
-            # Пользователь ещё не запускал бота, но партнёрка шлёт постбэки.
-            # Всё равно создаём запись — пригодится для статистики.
             user = User(telegram_id=tg_id)
             session.add(user)
 
-        user.trader_id = trader_id
+        user.trader_id = str(trader_id)
         user.is_registered = True
 
         await session.commit()
@@ -216,7 +279,7 @@ async def postback_registration(
         logger.error("run_access_flow_for_user error after registration: %s", e)
 
     # отстук в группу (если включено)
-    await send_postback_to_group("registration", trader_id, tg_id)
+    await send_postback_to_group("registration", str(trader_id), tg_id)
 
     return PlainTextResponse("OK")
 
@@ -227,27 +290,43 @@ async def postback_registration(
 
 async def _handle_deposit_common(
     request: Request,
-    trader_id: str,
-    click_id: str,
-    sumdep: float,
     event_name: str,
 ):
     await check_secret(request)
 
+    params = await extract_params(request)
+    trader_id = params.get("trader_id")
+    click_id = params.get("click_id")
+    sumdep_raw = params.get("sumdep")
+
+    if not trader_id or not click_id or sumdep_raw is None:
+        logger.warning(
+            "Missing params in %s: %s",
+            event_name,
+            params,
+        )
+        return PlainTextResponse("MISSING_PARAMS", status_code=200)
+
+    try:
+        tg_id = int(str(click_id))
+    except ValueError:
+        logger.warning("Invalid click_id for %s: %s", event_name, click_id)
+        return PlainTextResponse("BAD_CLICK_ID", status_code=200)
+
+    try:
+        sumdep = float(str(sumdep_raw).replace(",", "."))
+    except ValueError:
+        logger.warning("Invalid sumdep for %s: %s", event_name, sumdep_raw)
+        return PlainTextResponse("BAD_SUMDEP", status_code=200)
+
     logger.info(
-        "POSTBACK %s: trader_id=%s click_id=%s sumdep=%s from %s",
+        "POSTBACK %s parsed: trader_id=%s click_id=%s (tg_id=%s) sumdep=%s",
         event_name,
         trader_id,
         click_id,
+        tg_id,
         sumdep,
-        request.client.host if request.client else "unknown",
     )
-
-    try:
-        tg_id = int(click_id)
-    except ValueError:
-        logger.warning("Invalid click_id for %s: %s", event_name, click_id)
-        raise HTTPException(status_code=400, detail="Bad click_id")
 
     if db.async_session_maker is None:
         raise HTTPException(status_code=500, detail="DB not initialized")
@@ -265,7 +344,7 @@ async def _handle_deposit_common(
             session.add(user)
 
         if trader_id and not user.trader_id:
-            user.trader_id = trader_id
+            user.trader_id = str(trader_id)
 
         # пишем депозит
         dep = Deposit(user_id=user.id, amount=float(sumdep))
@@ -307,51 +386,29 @@ async def _handle_deposit_common(
             logger.error("notify_vip_granted error: %s", e)
 
     # отстук в группу
-    await send_postback_to_group("deposit", trader_id, tg_id, amount=float(sumdep))
+    await send_postback_to_group("deposit", str(trader_id), tg_id, amount=float(sumdep))
 
     return PlainTextResponse("OK")
 
 
 @app.get("/postback/first_deposit")
 @app.post("/postback/first_deposit")
-async def postback_first_deposit(
-    request: Request,
-    trader_id: str,
-    click_id: str,
-    sumdep: float,
-):
+async def postback_first_deposit(request: Request):
     """
     Первый депозит (FTD):
     trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}
     """
-    return await _handle_deposit_common(
-        request=request,
-        trader_id=trader_id,
-        click_id=click_id,
-        sumdep=sumdep,
-        event_name="first_deposit",
-    )
+    return await _handle_deposit_common(request=request, event_name="first_deposit")
 
 
 @app.get("/postback/redeposit")
 @app.post("/postback/redeposit")
-async def postback_redeposit(
-    request: Request,
-    trader_id: str,
-    click_id: str,
-    sumdep: float,
-):
+async def postback_redeposit(request: Request):
     """
     Повторный депозит:
     trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}
     """
-    return await _handle_deposit_common(
-        request=request,
-        trader_id=trader_id,
-        click_id=click_id,
-        sumdep=sumdep,
-        event_name="redeposit",
-    )
+    return await _handle_deposit_common(request=request, event_name="redeposit")
 
 
 # -------------------------------------------------
@@ -360,12 +417,7 @@ async def postback_redeposit(
 
 @app.get("/postback/withdraw")
 @app.post("/postback/withdraw")
-async def postback_withdraw(
-    request: Request,
-    trader_id: str,
-    click_id: str,
-    wdr_sum: float,
-):
+async def postback_withdraw(request: Request):
     """
     Вывод средств:
     trader_id={{trader_id}}&click_id={{click_id}}&wdr_sum={{wdr_sum}}
@@ -373,20 +425,35 @@ async def postback_withdraw(
     """
     await check_secret(request)
 
-    logger.info(
-        "POSTBACK withdraw: trader_id=%s click_id=%s wdr_sum=%s from %s",
-        trader_id,
-        click_id,
-        wdr_sum,
-        request.client.host if request.client else "unknown",
-    )
+    params = await extract_params(request)
+    trader_id = params.get("trader_id")
+    click_id = params.get("click_id")
+    wdr_raw = params.get("wdr_sum")
+
+    if not trader_id or not click_id or wdr_raw is None:
+        logger.warning("Missing params in withdraw: %s", params)
+        return PlainTextResponse("MISSING_PARAMS", status_code=200)
 
     try:
-        tg_id = int(click_id)
+        tg_id = int(str(click_id))
     except ValueError:
         logger.warning("Invalid click_id for withdraw: %s", click_id)
-        raise HTTPException(status_code=400, detail="Bad click_id")
+        return PlainTextResponse("BAD_CLICK_ID", status_code=200)
 
-    await send_postback_to_group("withdraw", trader_id, tg_id, amount=float(wdr_sum))
+    try:
+        wdr_sum = float(str(wdr_raw).replace(",", "."))
+    except ValueError:
+        logger.warning("Invalid wdr_sum for withdraw: %s", wdr_raw)
+        return PlainTextResponse("BAD_WDR_SUM", status_code=200)
+
+    logger.info(
+        "POSTBACK withdraw parsed: trader_id=%s click_id=%s (tg_id=%s) wdr_sum=%s",
+        trader_id,
+        click_id,
+        tg_id,
+        wdr_sum,
+    )
+
+    await send_postback_to_group("withdraw", str(trader_id), tg_id, amount=float(wdr_sum))
 
     return PlainTextResponse("OK")
