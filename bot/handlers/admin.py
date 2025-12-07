@@ -1,24 +1,23 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, Dict, List
+from typing import Optional
 
-from aiogram import Router, F, Bot
+from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from sqlalchemy import select, func, delete
 
 from ..models import base as db
 from ..models.user import User
-from ..models.settings import Settings
 from ..models.deposit import Deposit
+from ..models.settings import Settings
 from .main_menu import (
     run_access_flow_for_user,
     notify_basic_access_limited,
@@ -28,52 +27,101 @@ from .main_menu import (
 
 router = Router()
 
-# ============================================================
-#  Админские ID
-# ============================================================
 
-def get_admin_ids() -> List[int]:
-    raw = os.getenv("ADMINS", "")
-    ids: List[int] = []
-    for part in raw.split(","):
-        part = part.strip()
+# ===== ADMIN ACCESS =====
+
+def _load_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS", "")
+    result: set[int] = set()
+    for part in raw.replace(" ", "").split(","):
         if not part:
             continue
         try:
-            ids.append(int(part))
+            result.add(int(part))
         except ValueError:
             continue
-    return ids
+    return result
 
 
-def is_admin(tg_id: int) -> bool:
-    return tg_id in get_admin_ids()
+ADMIN_IDS: set[int] = _load_admin_ids()
 
 
-# ============================================================
-#  FSM состояния
-# ============================================================
-
-class LinksEditState(StatesGroup):
-    waiting_value = State()  # ждём новую ссылку / id
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
-class SettingsEditState(StatesGroup):
-    waiting_value = State()  # ждём новое число (порог)
+# ===== POSTBACK URL HELPERS =====
+
+def _get_postback_base_url() -> str:
+    """
+    Базовый URL для постбэков, например:
+    http://45.90.218.187:8000
+    Берётся из POSTBACK_BASE_URL в .env
+    """
+    base = os.getenv("POSTBACK_BASE_URL", "").strip()
+    if not base:
+        return ""
+    return base.rstrip("/")
 
 
-# в FSM будем хранить:
-#   field: имя поля в Settings
-#   kind:  "link" или "settings"
+def _build_postback_urls() -> dict[str, str]:
+    """
+    Собираем готовые URL для партнёрки с нужными макросами.
+    Макросы:
+        {trader_id}, {click_id}, {sumdep}, {wdr_sum}
+    """
+    base = _get_postback_base_url()
+    if not base:
+        return {}
+
+    return {
+        # регистрация: trader_id + click_id (tg id)
+        "registration": (
+            f"{base}/postback/registration"
+            "?trader_id={{trader_id}}&click_id={{click_id}}"
+        ),
+        # первый депозит: trader_id + click_id + sumdep
+        "ftd": (
+            f"{base}/postback/first_deposit"
+            "?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
+        ),
+        # повторный депозит: trader_id + click_id + sumdep
+        "redep": (
+            f"{base}/postback/redeposit"
+            "?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
+        ),
+        # вывод: trader_id + click_id + wdr_sum
+        "withdraw": (
+            f"{base}/postback/withdraw"
+            "?trader_id={{trader_id}}&click_id={{click_id}}&wdr_sum={{wdr_sum}}"
+        ),
+    }
 
 
-# ============================================================
-#  Хелперы для Settings
-# ============================================================
+# ===== STATES =====
 
-async def get_settings() -> Settings:
+class AdminLinksState(StatesGroup):
+    waiting_for_ref = State()
+    waiting_for_deposit = State()
+    waiting_for_channel_id = State()
+    waiting_for_channel_url = State()
+    waiting_for_support = State()
+
+
+class AdminStepsState(StatesGroup):
+    waiting_for_deposit_amount = State()
+    waiting_for_vip_amount = State()
+
+
+class AdminPostbacksState(StatesGroup):
+    waiting_for_chat_id = State()
+
+
+# ===== HELPERS: DB & STATS =====
+
+async def _get_or_create_settings() -> Settings:
     if db.async_session_maker is None:
-        raise RuntimeError("DB not initialized")
+        raise RuntimeError("DB session maker is not initialized")
 
     async with db.async_session_maker() as session:
         result = await session.execute(select(Settings).where(Settings.id == 1))
@@ -86,962 +134,1073 @@ async def get_settings() -> Settings:
         return settings
 
 
-async def save_settings(settings: Settings) -> None:
+async def _get_stats():
     if db.async_session_maker is None:
-        raise RuntimeError("DB not initialized")
+        return 0, 0, 0, 0.0
 
     async with db.async_session_maker() as session:
-        db_obj = await session.get(Settings, settings.id)
-        if not db_obj:
-            session.add(settings)
-        else:
-            for attr in (
-                "require_subscription",
-                "require_deposit",
-                "deposit_required_amount",
-                "vip_threshold_amount",
-                "channel_id",
-                "channel_url",
-                "ref_link",
-                "deposit_link",
-                "support_url",
-                "postbacks_group_id",
-                "send_reg_postbacks",
-                "send_deposit_postbacks",
-                "send_withdraw_postbacks",
-            ):
-                if hasattr(settings, attr):
-                    setattr(db_obj, attr, getattr(settings, attr))
-        await session.commit()
-
-
-# ============================================================
-#  Постбэки: базовый URL + генерация ссылок
-# ============================================================
-
-def get_postback_base_url() -> str:
-    base = os.getenv("POSTBACK_BASE_URL", "").strip()
-    if not base:
-        return ""
-    return base.rstrip("/")
-
-
-def build_postback_urls() -> Dict[str, str]:
-    base = get_postback_base_url()
-    if not base:
-        return {}
-
-    return {
-        # Регистрация: trader_id + click_id (tg id)
-        "registration": (
-            f"{base}/postback/registration"
-            "?trader_id={{trader_id}}&click_id={{click_id}}"
-        ),
-        # Первый депозит: trader_id + click_id + sumdep
-        "ftd": (
-            f"{base}/postback/first_deposit"
-            "?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
-        ),
-        # Повторный депозит: trader_id + click_id + sumdep
-        "redep": (
-            f"{base}/postback/redeposit"
-            "?trader_id={{trader_id}}&click_id={{click_id}}&sumdep={{sumdep}}"
-        ),
-        # Вывод: trader_id + click_id + wdr_sum
-        "withdraw": (
-            f"{base}/postback/withdraw"
-            "?trader_id={{trader_id}}&click_id={{click_id}}&wdr_sum={{wdr_sum}}"
-        ),
-    }
-
-
-# ============================================================
-#  Клавиатуры админки
-# ============================================================
-
-def admin_main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="👤 Пользователи",
-                    callback_data="admin_users_page:1",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔗 URL постбэков",
-                    callback_data="admin_postbacks",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⚙️ Настройки",
-                    callback_data="admin_settings",
-                ),
-                InlineKeyboardButton(
-                    text="🔗 Ссылки",
-                    callback_data="admin_links",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📨 Рассылка (WIP)",
-                    callback_data="admin_broadcast",
-                )
-            ],
-        ]
-    )
-
-
-def admin_users_pagination_kb(page: int, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
-    buttons_row = []
-    if has_prev:
-        buttons_row.append(
-            InlineKeyboardButton(
-                text="⬅️",
-                callback_data=f"admin_users_page:{page - 1}",
-            )
+        users_count = await session.scalar(select(func.count()).select_from(User)) or 0
+        deposits_count = await session.scalar(
+            select(func.count()).select_from(Deposit)
+        ) or 0
+        total_deposit_sum = await session.scalar(
+            select(func.coalesce(func.sum(Deposit.amount), 0))
         )
-    buttons_row.append(
-        InlineKeyboardButton(
-            text=f"Стр {page}",
-            callback_data="noop",
-        )
-    )
-    if has_next:
-        buttons_row.append(
-            InlineKeyboardButton(
-                text="➡️",
-                callback_data=f"admin_users_page:{page + 1}",
-            )
-        )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔍 Поиск",
-                    callback_data="admin_user_search",
-                )
-            ],
-            buttons_row,
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад в меню",
-                    callback_data="admin_menu",
-                )
-            ],
-        ]
-    )
-
-
-def admin_user_card_kb(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Выдать регу",
-                    callback_data=f"admin_user_give_reg:{user_id}",
-                ),
-                InlineKeyboardButton(
-                    text="💰 Выдать деп",
-                    callback_data=f"admin_user_give_dep:{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👑 Выдать VIP",
-                    callback_data=f"admin_user_give_vip:{user_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🚫 Забрать доступ",
-                    callback_data=f"admin_user_take_access:{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚫 Забрать VIP",
-                    callback_data=f"admin_user_take_vip:{user_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🗑 Удалить юзера",
-                    callback_data=f"admin_user_delete:{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад к пользователям",
-                    callback_data="admin_users_page:1",
-                )
-            ],
-        ]
-    )
-
-
-def admin_links_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔗 Реф. ссылка",
-                    callback_data="admin_link_edit:ref_link",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💰 Ссылка на депозит",
-                    callback_data="admin_link_edit:deposit_link",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📡 ID канала",
-                    callback_data="admin_link_edit:channel_id",
-                ),
-                InlineKeyboardButton(
-                    text="📡 Ссылка на канал",
-                    callback_data="admin_link_edit:channel_url",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🆘 Ссылка поддержки",
-                    callback_data="admin_link_edit:support_url",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад в меню",
-                    callback_data="admin_menu",
-                ),
-            ],
-        ]
-    )
-
-
-def admin_settings_kb(settings: Settings) -> InlineKeyboardMarkup:
-    require_sub = "✅" if settings.require_subscription else "❌"
-    require_dep = "✅" if settings.require_deposit else "❌"
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"{require_sub} Проверять подписку",
-                    callback_data="admin_settings_toggle:require_subscription",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"{require_dep} Проверять депозит",
-                    callback_data="admin_settings_toggle:require_deposit",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💰 Порог депозита",
-                    callback_data="admin_settings_edit:deposit_required_amount",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👑 Порог VIP",
-                    callback_data="admin_settings_edit:vip_threshold_amount",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад в меню",
-                    callback_data="admin_menu",
-                ),
-            ],
-        ]
-    )
-
-
-def admin_postbacks_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад в меню",
-                    callback_data="admin_menu",
-                )
-            ]
-        ]
-    )
-
-
-# ============================================================
-#  /admin вход
-# ============================================================
-
-@router.message(Command("admin"))
-async def admin_entry(message: Message) -> None:
-    if not is_admin(message.from_user.id):
-        return
-
-    # Статистика
-    if db.async_session_maker is None:
-        await message.answer("DB not initialized")
-        return
-
-    async with db.async_session_maker() as session:
-        total_users = (await session.execute(
-            select(func.count(User.id))
-        )).scalar_one()
-
-        total_registered = (await session.execute(
-            select(func.count(User.id)).where(User.is_registered == True)
-        )).scalar_one()
-
-        total_deposit_sum = (await session.execute(
-            select(func.coalesce(func.sum(Deposit.amount), 0.0))
-        )).scalar_one()
-
-    text = (
-        "👨‍💻 <b>Админка</b>\n\n"
-        f"Пользователей: <b>{total_users}</b>\n"
-        f"Регистраций: <b>{total_registered}</b>\n"
-        f"Сумма депозитов: <b>{float(total_deposit_sum):.2f}$</b>\n"
-    )
-
-    await message.answer(
-        text,
-        reply_markup=admin_main_kb(),
-    )
-
-
-# ============================================================
-#  Главное меню админки (callback)
-# ============================================================
-
-@router.callback_query(F.data == "admin_menu")
-async def admin_menu_cb(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    await callback.message.edit_text(
-        "👨‍💻 <b>Админка</b>",
-        reply_markup=admin_main_kb(),
-    )
-    await callback.answer()
-
-
-# ============================================================
-#  Пользователи: список и поиск
-# ============================================================
-
-PAGE_SIZE = 5
-
-
-async def format_user_line(user: User) -> str:
-    lang = user.language or "—"
-    sub = "✅" if user.is_subscribed else "❌"
-    reg = "✅" if user.is_registered else "❌"
-    dep = "✅" if user.has_basic_access else "❌"
-    vip = "✅" if user.is_vip else "❌"
+        registrations_count = await session.scalar(
+            select(func.count()).select_from(User).where(User.is_registered == True)
+        ) or 0  # noqa: E712
 
     return (
-        f"ID: <code>{user.id}</code> | TG: <code>{user.telegram_id}</code>\n"
-        f"Username: <code>{user.username or '—'}</code>\n"
-        f"Язык: <b>{lang}</b> | Подписка: {sub} | Рег: {reg} | Доступ: {dep} | VIP: {vip}\n"
-        f"<b>Открыть карточку:</b> /user_{user.id}\n"
-        "-----------\n"
+        users_count,
+        deposits_count,
+        registrations_count,
+        float(total_deposit_sum or 0.0),
     )
 
 
-@router.callback_query(F.data.startswith("admin_users_page:"))
-async def admin_users_page(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
+# ===== HELPERS: UI =====
 
-    _, page_str = callback.data.split(":", 1)
-    try:
-        page = int(page_str)
-    except ValueError:
-        page = 1
+async def _send_admin_menu(bot, chat_id: int) -> None:
+    users_count, deposits_count, registrations_count, total_deposit = await _get_stats()
+
+    text = (
+        "<b>АДМИНКА</b>\n\n"
+        f"👥 Пользователей: <b>{users_count}</b>\n"
+        f"💳 Депозитов: <b>{deposits_count}</b>\n"
+        f"✅ Регистраций: <b>{registrations_count}</b>\n"
+        f"💰 Сумма депозитов: <b>{total_deposit:.2f}</b>\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👥 Пользователи", callback_data="admin:users")
+    kb.button(text="🔗 URL постбэков", callback_data="admin:postbacks")
+    kb.button(text="⚙️ Настройки", callback_data="admin:settings")
+    kb.button(text="🔗 Ссылки", callback_data="admin:links")
+    kb.button(text="📨 Рассылка", callback_data="admin:broadcast")
+    kb.adjust(1, 1, 2, 1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
+
+
+async def _send_links_window(bot, chat_id: int) -> None:
+    settings = await _get_or_create_settings()
+
+    def norm(val: Optional[str]) -> str:
+        return val if val else "— не задано —"
+
+    text = (
+        "🔗 <b>Ссылки</b>\n\n"
+        f"Реф. ссылка:\n<code>{norm(settings.ref_link)}</code>\n\n"
+        f"Ссылка на депозит:\n<code>{norm(settings.deposit_link)}</code>\n\n"
+        f"ID канала:\n<code>{norm(settings.channel_id)}</code>\n\n"
+        f"Ссылка на канал:\n<code>{norm(settings.channel_url)}</code>\n\n"
+        f"Ссылка поддержки:\n<code>{norm(settings.support_url)}</code>\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Реф. ссылка", callback_data="admin:links:edit:ref")
+    kb.button(text="✏️ Ссылка на депозит", callback_data="admin:links:edit:deposit")
+    kb.button(text="✏️ ID канала", callback_data="admin:links:edit:channel_id")
+    kb.button(text="✏️ Ссылка на канал", callback_data="admin:links:edit:channel_url")
+    kb.button(text="✏️ Ссылка поддержки", callback_data="admin:links:edit:support")
+    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
+    kb.adjust(1, 1, 1, 1, 1, 1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
+
+
+async def _send_users_list(bot, chat_id: int, page: int = 1, page_size: int = 5) -> None:
     if page < 1:
         page = 1
 
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    async with db.async_session_maker() as session:
-        total_users = (await session.execute(
-            select(func.count(User.id))
-        )).scalar_one()
-
-        offset = (page - 1) * PAGE_SIZE
-        result = await session.execute(
-            select(User)
-            .order_by(User.id.desc())
-            .offset(offset)
-            .limit(PAGE_SIZE)
-        )
-        users = result.scalars().all()
-
-    text_lines = ["👤 <b>Пользователи</b>\n"]
-    if not users:
-        text_lines.append("Пока нет пользователей.")
-    else:
-        for u in users:
-            text_lines.append(await format_user_line(u))
-
-    has_prev = page > 1
-    has_next = total_users > page * PAGE_SIZE
-
-    await callback.message.edit_text(
-        "\n".join(text_lines),
-        reply_markup=admin_users_pagination_kb(page, has_prev, has_next),
-        disable_web_page_preview=True,
-    )
-    await callback.answer()
-
-
-# простенький поиск: ждём tg id или trader id
-class UserSearchState(StatesGroup):
-    waiting_query = State()
-
-
-@router.callback_query(F.data == "admin_user_search")
-async def admin_user_search_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    await state.set_state(UserSearchState.waiting_query)
-    await callback.message.edit_text(
-        "🔍 Введите <b>Telegram ID</b> или <b>Trader ID</b> пользователя:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ Назад к пользователям",
-                        callback_data="admin_users_page:1",
-                    )
-                ]
-            ]
-        ),
-    )
-    await callback.answer()
-
-
-@router.message(UserSearchState.waiting_query)
-async def admin_user_search_process(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    query = message.text.strip()
-    await state.clear()
-
-    if db.async_session_maker is None:
-        await message.answer("DB not initialized")
-        return
-
-    async with db.async_session_maker() as session:
-        stmt = select(User)
-        # пробуем как tg_id
-        try:
-            tg_id = int(query)
-            stmt = stmt.where(User.telegram_id == tg_id)
-        except ValueError:
-            # ищем по trader_id
-            stmt = stmt.where(User.trader_id == query)
-        result = await session.execute(stmt)
-        user: Optional[User] = result.scalar_one_or_none()
-
-    if not user:
-        await message.answer(
-            "Пользователь не найден.",
-            reply_markup=admin_users_pagination_kb(page=1, has_prev=False, has_next=False),
-        )
-        return
-
-    await send_user_card(message.bot, message.chat.id, user.id)
-
-
-# ============================================================
-#  Карточка пользователя
-# ============================================================
-
-async def send_user_card(bot: Bot, chat_id: int, user_id: int) -> None:
     if db.async_session_maker is None:
         await bot.send_message(chat_id, "DB not initialized")
         return
 
     async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
+        total_users = await session.scalar(
+            select(func.count()).select_from(User)
+        ) or 0
+
+        total_pages = max((total_users + page_size - 1) // page_size, 1)
+        if page > total_pages:
+            page = total_pages
+
+        offset = (page - 1) * page_size
+        result = await session.execute(
+            select(User)
+            .order_by(User.id)
+            .offset(offset)
+            .limit(page_size)
+        )
+        users = result.scalars().all()
+
+    text = (
+        "👥 <b>Пользователи</b>\n\n"
+        f"Всего: <b>{total_users}</b>\n"
+        f"Страница: <b>{page}</b> / <b>{total_pages}</b>\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+
+    kb.button(text="🔍 Поиск", callback_data="admin:users:search")
+
+    for u in users:
+        label = f"#{u.id} | tg:{u.telegram_id}"
+        kb.button(
+            text=label,
+            callback_data=f"admin:user:{u.id}:view",
+        )
+
+    prev_page = max(page - 1, 1)
+    next_page = min(page + 1, total_pages)
+    kb.button(text="⬅️", callback_data=f"admin:users:page:{prev_page}")
+    kb.button(text=f"Стр {page}", callback_data="admin:users:noop")
+    kb.button(text="➡️", callback_data=f"admin:users:page:{next_page}")
+    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
+
+    rows = [1]
+    rows += [1] * len(users)
+    rows += [3, 1]
+    kb.adjust(*rows)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
+
+
+async def _send_user_card(bot, chat_id: int, user_id: int, page: int = 1) -> None:
+    if db.async_session_maker is None:
+        await bot.send_message(chat_id, "DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user: Optional[User] = result.scalar_one_or_none()
+        if user is None:
             await bot.send_message(chat_id, "Пользователь не найден.")
             return
 
-        # сумма депов
-        total_deposit = (await session.execute(
-            select(func.coalesce(func.sum(Deposit.amount), 0.0)).where(
+        total_deposit = await session.scalar(
+            select(func.coalesce(func.sum(Deposit.amount), 0)).where(
                 Deposit.user_id == user.id
             )
-        )).scalar_one()
+        ) or 0.0
 
-    sub = "✅" if user.is_subscribed else "❌"
-    reg = "✅" if user.is_registered else "❌"
-    dep = "✅" if user.has_basic_access else "❌"
-    vip = "✅" if user.is_vip else "❌"
+    is_registered_display = bool(user.is_registered or user.trader_id)
+    has_deposit = total_deposit > 0
 
     text = (
         "👤 <b>Пользователь</b>\n\n"
         f"Telegram ID: <code>{user.telegram_id}</code>\n"
-        f"Username: <code>{user.username or '—'}</code>\n"
-        f"Trader ID: <code>{user.trader_id or '—'}</code>\n"
+        f"Username: <b>{user.username or '—'}</b>\n"
+        f"Trader ID: <b>{user.trader_id or '—'}</b>\n"
         f"Язык: <b>{user.language or '—'}</b>\n\n"
-        f"Подписка: {sub}\n"
-        f"Регистрация: {reg}\n"
-        f"Депозит: {dep} (сумма: <b>{float(total_deposit):.2f}$</b>)\n"
-        f"VIP: {vip}\n"
+        f"📡 Подписка: <b>{'✅' if user.is_subscribed else '❌'}</b>\n"
+        f"📝 Регистрация: <b>{'✅' if is_registered_display else '❌'}</b>\n"
+        f"💰 Депозит: <b>{'✅' if has_deposit else '❌'}</b> "
+        f"(сумма: <b>{float(total_deposit):.2f}$</b>)\n"
+        f"🔓 Доступ: <b>{'✅' if user.has_basic_access else '❌'}</b>\n"
+        f"👑 VIP: <b>{'✅' if user.is_vip else '❌'}</b>\n"
     )
 
-    await bot.send_message(
-        chat_id,
-        text,
-        reply_markup=admin_user_card_kb(user.id),
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Выдать регу", callback_data=f"admin:user:{user.id}:give_reg")
+    kb.button(text="💰 Выдать деп", callback_data=f"admin:user:{user.id}:give_dep")
+    kb.button(text="👑 Выдать VIP", callback_data=f"admin:user:{user.id}:give_vip")
+    kb.button(
+        text="🚫 Забрать доступ",
+        callback_data=f"admin:user:{user.id}:revoke_access",
     )
-
-
-@router.message(F.text.regexp(r"^/user_(\d+)$"))
-async def admin_user_by_command(message: Message) -> None:
-    if not is_admin(message.from_user.id):
-        return
-
-    import re
-    m = re.match(r"^/user_(\d+)$", message.text.strip())
-    if not m:
-        return
-    user_id = int(m.group(1))
-    await send_user_card(message.bot, message.chat.id, user_id)
-
-
-@router.callback_query(F.data.startswith("admin_user_give_reg:"))
-async def admin_user_give_reg(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, id_str = callback.data.split(":", 1)
-    user_id = int(id_str)
-
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
-        user.is_registered = True
-        await session.commit()
-        tg_id = user.telegram_id
-
-    await callback.answer("Регистрация выдана ✅", show_alert=False)
-    await callback.message.delete()
-    await send_user_card(callback.message.bot, callback.message.chat.id, user_id)
-
-    # запускаем флоу, чтобы прислать следующий шаг (депозит или доступ)
-    await run_access_flow_for_user(callback.message.bot, tg_id)
-
-
-@router.callback_query(F.data.startswith("admin_user_give_dep:"))
-async def admin_user_give_dep(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, id_str = callback.data.split(":", 1)
-    user_id = int(id_str)
-
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    # Для простоты: даём депозит 0.0 — всё равно дальше логика опирается
-    # на общую сумму и пороги. В реале можно сделать отдельное окно ввода суммы.
-    async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
-
-        dep = Deposit(user_id=user.id, amount=0.0)
-        session.add(dep)
-        await session.commit()
-        tg_id = user.telegram_id
-
-    await callback.answer("Депозит выдан (0.0$) ✅", show_alert=False)
-    await callback.message.delete()
-    await send_user_card(callback.message.bot, callback.message.chat.id, user_id)
-
-    # перезапускаем флоу
-    await run_access_flow_for_user(callback.message.bot, tg_id)
-
-
-@router.callback_query(F.data.startswith("admin_user_give_vip:"))
-async def admin_user_give_vip(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, id_str = callback.data.split(":", 1)
-    user_id = int(id_str)
-
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
-        user.is_vip = True
-        # на всякий случай откроем и обычный доступ
-        user.has_basic_access = True
-        await session.commit()
-        tg_id = user.telegram_id
-
-    await callback.answer("VIP выдан ✅", show_alert=False)
-    await callback.message.delete()
-    await send_user_card(callback.message.bot, callback.message.chat.id, user_id)
-
-    await notify_vip_granted(callback.message.bot, tg_id)
-
-
-@router.callback_query(F.data.startswith("admin_user_take_access:"))
-async def admin_user_take_access(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, id_str = callback.data.split(":", 1)
-    user_id = int(id_str)
-
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
-        user.has_basic_access = False
-        await session.commit()
-        tg_id = user.telegram_id
-
-    await callback.answer("Доступ забран", show_alert=False)
-    await callback.message.delete()
-    await send_user_card(callback.message.bot, callback.message.chat.id, user_id)
-
-    await notify_basic_access_limited(callback.message.bot, tg_id)
-
-
-@router.callback_query(F.data.startswith("admin_user_take_vip:"))
-async def admin_user_take_vip(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, id_str = callback.data.split(":", 1)
-    user_id = int(id_str)
-
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
-        user.is_vip = False
-        await session.commit()
-        tg_id = user.telegram_id
-
-    await callback.answer("VIP доступ забран", show_alert=False)
-    await callback.message.delete()
-    await send_user_card(callback.message.bot, callback.message.chat.id, user_id)
-
-    await notify_vip_access_limited(callback.message.bot, tg_id)
-
-
-@router.callback_query(F.data.startswith("admin_user_delete:"))
-async def admin_user_delete(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, id_str = callback.data.split(":", 1)
-    user_id = int(id_str)
-
-    if db.async_session_maker is None:
-        await callback.answer("DB not initialized", show_alert=True)
-        return
-
-    async with db.async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            await callback.answer("Уже удалён", show_alert=True)
-            return
-
-        # удаляем все депозиты и самого юзера
-        await session.execute(delete(Deposit).where(Deposit.user_id == user.id))
-        await session.delete(user)
-        await session.commit()
-
-    await callback.answer("Пользователь полностью удалён", show_alert=True)
-    await callback.message.delete()
-
-
-# ============================================================
-#  Ссылки (ref, депозит, канал, поддержка)
-# ============================================================
-
-@router.callback_query(F.data == "admin_links")
-async def admin_links_menu(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    settings = await get_settings()
-
-    text = (
-        "🔗 <b>Ссылки</b>\n\n"
-        f"Реф. ссылка: <code>{settings.ref_link or '—'}</code>\n\n"
-        f"Ссылка на депозит: <code>{settings.deposit_link or '—'}</code>\n\n"
-        f"ID канала: <code>{settings.channel_id or '—'}</code>\n"
-        f"Ссылка на канал: <code>{settings.channel_url or '—'}</code>\n\n"
-        f"Ссылка поддержки: <code>{settings.support_url or '—'}</code>\n"
+    kb.button(
+        text="💎 Забрать VIP доступ",
+        callback_data=f"admin:user:{user.id}:revoke_vip",
     )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_links_kb(),
-        disable_web_page_preview=True,
+    kb.button(text="🗑 Удалить юзера", callback_data=f"admin:user:{user.id}:delete")
+    kb.button(
+        text="⬅️ Назад к пользователям",
+        callback_data=f"admin:users:page:{page}",
     )
-    await callback.answer()
+    kb.adjust(2, 2, 2, 1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
 
 
-@router.callback_query(F.data.startswith("admin_link_edit:"))
-async def admin_link_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
+async def _send_settings_window(bot, chat_id: int) -> None:
+    settings = await _get_or_create_settings()
 
-    _, field = callback.data.split(":", 1)
-
-    field_titles = {
-        "ref_link": "реферальную ссылку",
-        "deposit_link": "ссылку на депозит",
-        "channel_id": "ID канала",
-        "channel_url": "ссылку на канал",
-        "support_url": "ссылку поддержки",
-    }
-
-    title = field_titles.get(field, field)
-
-    await state.set_state(LinksEditState.waiting_value)
-    await state.update_data(field=field)
-
-    await callback.message.edit_text(
-        f"✏️ Отправь новое значение для <b>{title}</b>.\n"
-        f"Для очистки отправь прочерк <code>-</code>.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ Назад к ссылкам",
-                        callback_data="admin_links",
-                    )
-                ]
-            ]
-        ),
-        disable_web_page_preview=True,
-    )
-    await callback.answer()
-
-
-@router.message(LinksEditState.waiting_value)
-async def admin_link_edit_save(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    data = await state.get_data()
-    field = data.get("field")
-    value = message.text.strip()
-    await state.clear()
-
-    settings = await get_settings()
-
-    if value == "-":
-        value = None
-
-    if field and hasattr(settings, field):
-        setattr(settings, field, value)
-
-    await save_settings(settings)
-
-    await message.answer("✅ Сохранено.", reply_markup=admin_links_kb())
-    # сразу обновим текст со ссылками
-    await admin_links_menu_fake(message)
-
-
-async def admin_links_menu_fake(message: Message) -> None:
-    """Та же логика, что и admin_links_menu, но от Message."""
-    settings = await get_settings()
-    text = (
-        "🔗 <b>Ссылки</b>\n\n"
-        f"Реф. ссылка: <code>{settings.ref_link or '—'}</code>\n\n"
-        f"Ссылка на депозит: <code>{settings.deposit_link or '—'}</code>\n\n"
-        f"ID канала: <code>{settings.channel_id or '—'}</code>\n"
-        f"Ссылка на канал: <code>{settings.channel_url or '—'}</code>\n\n"
-        f"Ссылка поддержки: <code>{settings.support_url or '—'}</code>\n"
-    )
-    await message.answer(
-        text,
-        reply_markup=admin_links_kb(),
-        disable_web_page_preview=True,
-    )
-
-
-# ============================================================
-#  Настройки (флаги и пороги)
-# ============================================================
-
-@router.callback_query(F.data == "admin_settings")
-async def admin_settings_menu(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    settings = await get_settings()
+    def yn(val: bool) -> str:
+        return "✅ Да" if val else "❌ Нет"
 
     text = (
         "⚙️ <b>Настройки</b>\n\n"
-        f"Проверять подписку: <b>{'Да' if settings.require_subscription else 'Нет'}</b>\n"
-        f"Проверять депозит: <b>{'Да' if settings.require_deposit else 'Нет'}</b>\n\n"
-        f"Порог депозита для доступа: <b>{float(settings.deposit_required_amount or 0.0):.2f}$</b>\n"
-        f"Порог VIP: <b>{float(settings.vip_threshold_amount or 0.0):.2f}$</b>\n"
+        "🔹 <b>Проверки шагов</b>\n"
+        f"• Проверять подписку: <b>{yn(settings.require_subscription)}</b>\n"
+        f"• Проверять депозит: <b>{yn(settings.require_deposit)}</b>\n"
+        f"• Порог депозита: <b>{float(settings.deposit_required_amount or 0):.2f}$</b>\n"
+        f"• Порог VIP: <b>{float(settings.vip_threshold_amount or 0):.2f}$</b>\n\n"
+        "🔹 <b>Постбэки в группу</b>\n"
+        f"• Чат для постбэков: <code>{settings.postbacks_chat_id or '— не задан —'}</code>\n"
+        f"• Регистрация: <b>{yn(settings.send_postbacks_registration)}</b>\n"
+        f"• Депозит: <b>{yn(settings.send_postbacks_deposit)}</b>\n"
+        f"• Вывод: <b>{yn(settings.send_postbacks_withdraw)}</b>\n"
     )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_settings_kb(settings),
-        disable_web_page_preview=True,
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚙️ Настройка шагов", callback_data="admin:settings:steps")
+    kb.button(
+        text="📩 Постбэки в группу",
+        callback_data="admin:settings:postbacks_group",
     )
-    await callback.answer()
+    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
+    kb.adjust(1, 1, 1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
 
 
-@router.callback_query(F.data.startswith("admin_settings_toggle:"))
-async def admin_settings_toggle(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
+async def _send_steps_window(bot, chat_id: int) -> None:
+    settings = await _get_or_create_settings()
 
-    _, field = callback.data.split(":", 1)
-    settings = await get_settings()
+    def yn(val: bool) -> str:
+        return "✅ Да" if val else "❌ Нет"
 
-    if hasattr(settings, field):
-        current = bool(getattr(settings, field))
-        setattr(settings, field, not current)
-        await save_settings(settings)
-
-    await admin_settings_menu(callback)
-
-
-@router.callback_query(F.data.startswith("admin_settings_edit:"))
-async def admin_settings_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    _, field = callback.data.split(":", 1)
-
-    titles = {
-        "deposit_required_amount": "порог депозита для доступа (в $)",
-        "vip_threshold_amount": "порог VIP (в $)",
-    }
-
-    await state.set_state(SettingsEditState.waiting_value)
-    await state.update_data(field=field)
-
-    await callback.message.edit_text(
-        f"✏️ Введи новое значение для <b>{titles.get(field, field)}</b>.\n"
-        f"Текущее будет переписано.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ Назад к настройкам",
-                        callback_data="admin_settings",
-                    )
-                ]
-            ]
-        ),
+    text = (
+        "⚙️ <b>Настройка шагов доступа</b>\n\n"
+        f"• Проверять подписку: <b>{yn(settings.require_subscription)}</b>\n"
+        f"• Проверять депозит: <b>{yn(settings.require_deposit)}</b>\n"
+        f"• Порог депозита: <b>{float(settings.deposit_required_amount or 0):.2f}$</b>\n"
+        f"• Порог VIP: <b>{float(settings.vip_threshold_amount or 0):.2f}$</b>\n\n"
+        "Регистрация считается обязательным шагом по умолчанию.\n"
     )
-    await callback.answer()
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="🔁 Переключить подписку",
+        callback_data="admin:steps:toggle:subscription",
+    )
+    kb.button(
+        text="🔁 Переключить депозит",
+        callback_data="admin:steps:toggle:deposit",
+    )
+    kb.button(
+        text="✏️ Порог депозита", callback_data="admin:steps:edit:deposit_amount"
+    )
+    kb.button(text="✏️ Порог VIP", callback_data="admin:steps:edit:vip_amount")
+    kb.button(
+        text="⬅️ Назад к настройкам",
+        callback_data="admin:settings",
+    )
+    kb.adjust(1, 1, 1, 1, 1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
 
 
-@router.message(SettingsEditState.waiting_value)
-async def admin_settings_edit_save(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
+async def _send_postbacks_group_window(bot, chat_id: int) -> None:
+    settings = await _get_or_create_settings()
+
+    def yn(val: bool) -> str:
+        return "✅ Вкл" if val else "❌ Выкл"
+
+    text = (
+        "📩 <b>Постбэки в группу</b>\n\n"
+        f"Чат для постбэков:\n<code>{settings.postbacks_chat_id or '— не задан —'}</code>\n\n"
+        "Какие события слать в группу:\n"
+        f"• Регистрация: <b>{yn(settings.send_postbacks_registration)}</b>\n"
+        f"• Депозит: <b>{yn(settings.send_postbacks_deposit)}</b>\n"
+        f"• Вывод: <b>{yn(settings.send_postbacks_withdraw)}</b>\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="✏️ Чат постбэков",
+        callback_data="admin:postbacks_group:edit:chat",
+    )
+    kb.button(
+        text="🔁 Регистрация",
+        callback_data="admin:postbacks_group:toggle:registration",
+    )
+    kb.button(
+        text="🔁 Депозит",
+        callback_data="admin:postbacks_group:toggle:deposit",
+    )
+    kb.button(
+        text="🔁 Вывод",
+        callback_data="admin:postbacks_group:toggle:withdraw",
+    )
+    kb.button(
+        text="⬅️ Назад к настройкам",
+        callback_data="admin:settings",
+    )
+    kb.adjust(1, 1, 1, 1, 1)
+
+    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
+
+
+# ===== HANDLERS: /admin =====
+
+@router.message(Command("admin"))
+async def admin_entry(message: Message) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа.")
         return
 
-    data = await state.get_data()
-    field = data.get("field")
-    value_raw = message.text.strip()
-    await state.clear()
-
+    chat_id = message.chat.id
     try:
-        value = float(value_raw.replace(",", "."))
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_admin_menu(message.bot, chat_id)
+
+
+@router.callback_query(F.data == "admin:menu")
+async def admin_menu_from_callback(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    await _send_admin_menu(callback.message.bot, chat_id)
+
+
+# ===== HANDLERS: ССЫЛКИ =====
+
+@router.callback_query(F.data == "admin:links")
+async def admin_links(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    await _send_links_window(callback.message.bot, chat_id)
+
+
+@router.callback_query(F.data.startswith("admin:links:edit:"))
+async def admin_links_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    _, _, _, field = data.split(":", 3)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    if field == "ref":
+        await state.set_state(AdminLinksState.waiting_for_ref)
+        prompt = "✏️ Отправьте новую реферальную ссылку:"
+    elif field == "deposit":
+        await state.set_state(AdminLinksState.waiting_for_deposit)
+        prompt = "✏️ Отправьте новую ссылку на депозит:"
+    elif field == "channel_id":
+        await state.set_state(AdminLinksState.waiting_for_channel_id)
+        prompt = "✏️ Отправьте новый ID канала (например, -1001234567890):"
+    elif field == "channel_url":
+        await state.set_state(AdminLinksState.waiting_for_channel_url)
+        prompt = "✏️ Отправьте новую ссылку на канал (t.me/...):"
+    elif field == "support":
+        await state.set_state(AdminLinksState.waiting_for_support)
+        prompt = "✏️ Отправьте новую ссылку поддержки:"
+    else:
+        await callback.answer("Неизвестное поле", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад к ссылкам", callback_data="admin:links")
+
+    chat_id = callback.from_user.id
+    await callback.message.bot.send_message(
+        chat_id, prompt, reply_markup=kb.as_markup()
+    )
+
+
+@router.message(AdminLinksState.waiting_for_ref)
+async def admin_links_set_ref(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    new_value = (message.text or "").strip()
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.ref_link = new_value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_links_window(message.bot, message.chat.id)
+
+
+@router.message(AdminLinksState.waiting_for_deposit)
+async def admin_links_set_deposit(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    new_value = (message.text or "").strip()
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.deposit_link = new_value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_links_window(message.bot, message.chat.id)
+
+
+@router.message(AdminLinksState.waiting_for_channel_id)
+async def admin_links_set_channel_id(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    new_value = (message.text or "").strip()
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.channel_id = new_value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_links_window(message.bot, message.chat.id)
+
+
+@router.message(AdminLinksState.waiting_for_channel_url)
+async def admin_links_set_channel_url(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    new_value = (message.text or "").strip()
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.channel_url = new_value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_links_window(message.bot, message.chat.id)
+
+
+@router.message(AdminLinksState.waiting_for_support)
+async def admin_links_set_support(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    new_value = (message.text or "").strip()
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.support_url = new_value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_links_window(message.bot, message.chat.id)
+
+
+# ===== HANDLERS: НАСТРОЙКИ =====
+
+@router.callback_query(F.data == "admin:settings")
+async def admin_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_settings_window(callback.message.bot, chat_id)
+
+
+@router.callback_query(F.data == "admin:settings:steps")
+async def admin_settings_steps(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_steps_window(callback.message.bot, chat_id)
+
+
+@router.callback_query(F.data.startswith("admin:steps:toggle:"))
+async def admin_steps_toggle(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    _, _, _, field = data.split(":", 3)
+
+    if db.async_session_maker is None:
+        await callback.answer("DB not initialized", show_alert=True)
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+
+        if field == "subscription":
+            settings.require_subscription = not bool(settings.require_subscription)
+        elif field == "deposit":
+            settings.require_deposit = not bool(settings.require_deposit)
+        else:
+            await callback.answer("Неизвестное поле", show_alert=True)
+            return
+
+        await session.commit()
+
+    await callback.answer("Обновлено")
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await _send_steps_window(callback.message.bot, callback.message.chat.id)
+
+
+@router.callback_query(F.data.startswith("admin:steps:edit:"))
+async def admin_steps_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    _, _, _, field = data.split(":", 3)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    if field == "deposit_amount":
+        await state.set_state(AdminStepsState.waiting_for_deposit_amount)
+        prompt = "✏️ Отправьте новый порог депозита в $ (например, 100 или 250.50):"
+    elif field == "vip_amount":
+        await state.set_state(AdminStepsState.waiting_for_vip_amount)
+        prompt = "✏️ Отправьте новый порог VIP в $ (например, 1000 или 1500.00):"
+    else:
+        await callback.answer("Неизвестное поле", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад к шагам", callback_data="admin:settings:steps")
+
+    chat_id = callback.from_user.id
+    await callback.message.bot.send_message(
+        chat_id, prompt, reply_markup=kb.as_markup()
+    )
+
+
+@router.message(AdminStepsState.waiting_for_deposit_amount)
+async def admin_steps_set_deposit_amount(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        value = float(raw)
+        if value < 0:
+            raise ValueError
     except ValueError:
-        await message.answer("❌ Нужно ввести число.")
+        await message.answer("Нужно положительное число, например 100 или 250.50")
         return
 
-    settings = await get_settings()
-    if field and hasattr(settings, field):
-        setattr(settings, field, value)
-        await save_settings(settings)
-
-    await message.answer("✅ Порог сохранён.")
-    # покажем настройки
-    fake_cb = type("FakeCb", (), {"from_user": message.from_user, "message": message})
-    await admin_settings_menu(fake_cb)  # небольшой трюк, чтобы переиспользовать функцию
-
-
-# ============================================================
-#  URL постбэков
-# ============================================================
-
-@router.callback_query(F.data == "admin_postbacks")
-async def admin_postbacks_menu(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
         return
 
-    urls = build_postback_urls()
-    base = get_postback_base_url()
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.deposit_required_amount = value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_steps_window(message.bot, message.chat.id)
+
+
+@router.message(AdminStepsState.waiting_for_vip_amount)
+async def admin_steps_set_vip_amount(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        value = float(raw)
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно положительное число, например 1000 или 1500.00")
+        return
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.vip_threshold_amount = value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_steps_window(message.bot, message.chat.id)
+
+
+# ===== HANDLERS: ПОСТБЭКИ В ГРУППУ =====
+
+@router.callback_query(F.data == "admin:settings:postbacks_group")
+async def admin_postbacks_group(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_postbacks_group_window(callback.message.bot, chat_id)
+
+
+@router.callback_query(F.data.startswith("admin:postbacks_group:toggle:"))
+async def admin_postbacks_group_toggle(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    _, _, _, field = data.split(":", 3)
+
+    if db.async_session_maker is None:
+        await callback.answer("DB not initialized", show_alert=True)
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+
+        if field == "registration":
+            settings.send_postbacks_registration = not bool(
+                settings.send_postbacks_registration
+            )
+        elif field == "deposit":
+            settings.send_postbacks_deposit = not bool(
+                settings.send_postbacks_deposit
+            )
+        elif field == "withdraw":
+            settings.send_postbacks_withdraw = not bool(
+                settings.send_postbacks_withdraw
+            )
+        else:
+            await callback.answer("Неизвестное поле", show_alert=True)
+            return
+
+        await session.commit()
+
+    await callback.answer("Обновлено")
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await _send_postbacks_group_window(callback.message.bot, callback.message.chat.id)
+
+
+@router.callback_query(F.data == "admin:postbacks_group:edit:chat")
+async def admin_postbacks_group_edit_chat(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.set_state(AdminPostbacksState.waiting_for_chat_id)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="⬅️ Назад к постбэкам",
+        callback_data="admin:settings:postbacks_group",
+    )
+
+    chat_id = callback.from_user.id
+    await callback.message.bot.send_message(
+        chat_id,
+        "✏️ Отправьте ID или @username чата/группы для постбэков:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.message(AdminPostbacksState.waiting_for_chat_id)
+async def admin_postbacks_group_set_chat(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    new_value = (message.text or "").strip()
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(Settings).where(Settings.id == 1))
+        settings: Optional[Settings] = result.scalar_one_or_none()
+        if settings is None:
+            settings = Settings(id=1)
+            session.add(settings)
+        settings.postbacks_chat_id = new_value
+        await session.commit()
+
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _send_postbacks_group_window(message.bot, message.chat.id)
+
+
+# ===== HANDLERS: ПОЛЬЗОВАТЕЛИ =====
+
+@router.callback_query(F.data == "admin:users")
+async def admin_users(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_users_list(callback.message.bot, chat_id, page=1)
+
+
+@router.callback_query(F.data.startswith("admin:users:page:"))
+async def admin_users_page(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    try:
+        _, _, _, page_str = data.split(":")
+        page = int(page_str)
+    except Exception:
+        page = 1
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await _send_users_list(callback.message.bot, chat_id, page=page)
+
+
+@router.callback_query(F.data == "admin:users:search")
+async def admin_users_search(callback: CallbackQuery) -> None:
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Поиск пока не реализован", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin:user:"))
+async def admin_user_actions(callback: CallbackQuery) -> None:
+    """
+    admin:user:<id>:action
+
+    action = view | give_reg | give_dep | give_vip | revoke_access | revoke_vip | delete
+    """
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = callback.data or ""
+    parts = data.split(":")
+    if len(parts) < 4:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    _, _, user_id_str, action = parts
+    try:
+        user_id = int(user_id_str)
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    admin_chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+
+    # просто посмотреть карточку
+    if action == "view":
+        if callback.message:
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+        await _send_user_card(callback.message.bot, admin_chat_id, user_id)
+        return
+
+    if db.async_session_maker is None:
+        await callback.answer("DB not initialized", show_alert=True)
+        return
+
+    async with db.async_session_maker() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user: Optional[User] = result.scalar_one_or_none()
+        if user is None:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+
+        settings = await _get_or_create_settings()
+
+        # --- ВЫДАТЬ РЕГУ ---
+        if action == "give_reg":
+            user.is_registered = True
+            await session.commit()
+
+            await callback.answer("Регистрация выдана", show_alert=False)
+            if callback.message:
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+
+            await run_access_flow_for_user(callback.message.bot, user.telegram_id)
+            await _send_user_card(callback.message.bot, admin_chat_id, user_id)
+            return
+
+        # --- ВЫДАТЬ ДЕП ---
+        elif action == "give_dep":
+            amount = float(settings.deposit_required_amount or 0)
+            if amount <= 0:
+                amount = 1.0
+
+            dep = Deposit(user_id=user.id, amount=amount)
+            session.add(dep)
+            await session.commit()
+
+            await callback.answer("Депозит выдан", show_alert=False)
+            if callback.message:
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+
+            await run_access_flow_for_user(callback.message.bot, user.telegram_id)
+            await _send_user_card(callback.message.bot, admin_chat_id, user_id)
+            return
+
+        # --- ВЫДАТЬ VIP ---
+        elif action == "give_vip":
+            user.is_vip = True
+            await session.commit()
+
+            await callback.answer("VIP выдан", show_alert=False)
+            if callback.message:
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+
+            await notify_vip_granted(callback.message.bot, user.telegram_id)
+            await _send_user_card(callback.message.bot, admin_chat_id, user_id)
+            return
+
+        # --- ЗАБРАТЬ БАЗОВЫЙ ДОСТУП ---
+        elif action == "revoke_access":
+            user.has_basic_access = False
+            await session.commit()
+
+            await callback.answer("Доступ забран", show_alert=False)
+            if callback.message:
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+
+            await notify_basic_access_limited(callback.message.bot, user.telegram_id)
+            await _send_user_card(callback.message.bot, admin_chat_id, user_id)
+            return
+
+        # --- ЗАБРАТЬ VIP ---
+        elif action == "revoke_vip":
+            user.is_vip = False
+            await session.commit()
+
+            await callback.answer("VIP доступ забран", show_alert=False)
+            if callback.message:
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+
+            await notify_vip_access_limited(callback.message.bot, user.telegram_id)
+            await _send_user_card(callback.message.bot, admin_chat_id, user_id)
+            return
+
+        # --- УДАЛИТЬ ЮЗЕРА ---
+        elif action == "delete":
+            await session.delete(user)
+            await session.commit()
+
+            await callback.answer("Пользователь удалён", show_alert=False)
+            if callback.message:
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+
+            await _send_users_list(callback.message.bot, admin_chat_id, page=1)
+            return
+
+        else:
+            await callback.answer("Неизвестное действие", show_alert=True)
+            return
+
+
+# ===== ПРОЧИЕ КНОПКИ =====
+
+@router.callback_query(F.data == "admin:postbacks")
+async def admin_postbacks_window(callback: CallbackQuery) -> None:
+    """
+    Окно с готовыми URL для постбэков + описание макросов.
+    """
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    base = _get_postback_base_url()
+    urls = _build_postback_urls() if base else {}
 
     if not base:
         text = (
             "⚠️ <b>URL постбэков</b>\n\n"
-            "Базовый адрес постбэков не настроен.\n\n"
-            "Добавь переменную <code>POSTBACK_BASE_URL</code> в <code>.env</code>, например:\n"
+            "Базовый адрес не настроен.\n\n"
+            "Добавь в <code>.env</code> строку, например:\n"
             "<code>POSTBACK_BASE_URL=http://45.90.218.187:8000</code>\n"
         )
     else:
@@ -1058,44 +1217,37 @@ async def admin_postbacks_menu(callback: CallbackQuery) -> None:
             f"<code>{urls['withdraw']}</code>\n\n"
             "📌 <b>Макросы</b>\n"
             "• <code>{trader_id}</code> — ID трейдера у брокера\n"
-            "• <code>{click_id}</code> — Telegram ID пользователя\n"
+            "• <code>{click_id}</code> — Telegram ID (tg id)\n"
             "• <code>{sumdep}</code> — сумма депозита\n"
             "• <code>{wdr_sum}</code> — сумма вывода\n"
         )
 
-    await callback.message.edit_text(
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ В админ-меню", callback_data="admin:menu")
+    kb.adjust(1)
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    await callback.message.bot.send_message(
+        callback.from_user.id,
         text,
-        reply_markup=admin_postbacks_kb(),
+        reply_markup=kb.as_markup(),
         disable_web_page_preview=True,
     )
-    await callback.answer()
 
 
-# ============================================================
-#  Рассылка (пока заглушка)
-# ============================================================
-
-@router.callback_query(F.data == "admin_broadcast")
+@router.callback_query(F.data == "admin:broadcast")
 async def admin_broadcast_stub(callback: CallbackQuery) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer()
+    if callback.from_user is None or not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
         return
+    await callback.answer("Рассылку сделаем позже.", show_alert=True)
 
-    text = (
-        "📨 <b>Рассылка</b>\n\n"
-        "Функция рассылки пока в разработке."
-    )
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад в меню",
-                    callback_data="admin_menu",
-                )
-            ]
-        ]
-    )
-
-    await callback.message.edit_text(text, reply_markup=kb)
+@router.callback_query(F.data == "admin:users:noop")
+async def admin_users_noop(callback: CallbackQuery) -> None:
     await callback.answer()
