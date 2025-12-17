@@ -77,6 +77,10 @@ class AdminBroadcastState(StatesGroup):
     confirming = State()
 
 
+class AdminUsersSearchState(StatesGroup):
+    waiting_for_query = State()
+
+
 # ===== HELPERS: DB & STATS =====
 
 async def _get_or_create_settings() -> Settings:
@@ -1007,7 +1011,7 @@ async def admin_steps_set_vip_amount(message: Message, state: FSMContext) -> Non
     await _send_steps_window(message.bot, message.chat.id)
 
 
-# ===== HANDЛERS: ПОСТБЭКИ В ГРУППУ =====
+# ===== HANDLERS: ПОСТБЭКИ В ГРУППУ =====
 
 @router.callback_query(F.data == "admin:settings:postbacks_group")
 async def admin_postbacks_group(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1361,11 +1365,88 @@ async def admin_users_page(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "admin:users:search")
-async def admin_users_search(callback: CallbackQuery) -> None:
+async def admin_users_search(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user is None or not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.answer("Поиск пока не реализован", show_alert=True)
+
+    await callback.answer()
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    await state.set_state(AdminUsersSearchState.waiting_for_query)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="⬅️ Назад к пользователям",
+        callback_data="admin:users",
+    )
+    kb.adjust(1)
+
+    await callback.message.bot.send_message(
+        callback.from_user.id,
+        "🔍 Отправьте <b>Telegram ID</b> или <b>Trader ID</b> пользователя:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.message(AdminUsersSearchState.waiting_for_query)
+async def admin_users_search_query(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not _is_admin(message.from_user.id):
+        return
+
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Введите Telegram ID или Trader ID.")
+        return
+
+    if db.async_session_maker is None:
+        await message.answer("DB not initialized")
+        return
+
+    async with db.async_session_maker() as session:
+        user: Optional[User] = None
+
+        # если число — пробуем как telegram_id
+        if query.isdigit():
+            tg_id = int(query)
+            result = await session.execute(
+                select(User).where(User.telegram_id == tg_id)
+            )
+            user = result.scalar_one_or_none()
+
+        # если не нашли по tg_id или query не число — пробуем как trader_id
+        if user is None:
+            result = await session.execute(
+                select(User).where(User.trader_id == query)
+            )
+            user = result.scalar_one_or_none()
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await state.clear()
+
+    if user is None:
+        kb = InlineKeyboardBuilder()
+        kb.button(
+            text="⬅️ Назад к пользователям",
+            callback_data="admin:users",
+        )
+        kb.adjust(1)
+        await message.bot.send_message(
+            message.chat.id,
+            "❌ Пользователь не найден.",
+            reply_markup=kb.as_markup(),
+        )
+        return
+
+    await _send_user_card(message.bot, message.chat.id, user.id, page=1)
 
 
 @router.callback_query(F.data.startswith("admin:user:"))
